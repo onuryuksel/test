@@ -1,208 +1,223 @@
 import streamlit as st
-import pandas as pd
+# requests kütüphanesine artık gerek yok
 from bs4 import BeautifulSoup
+import pandas as pd
 import re
-import io
-import traceback # Hata ayıklama için
+import json
+from io import StringIO
+import os # Dosya adı işlemleri için
 
-# Session state'i kullanarak uyarıların tekrar tekrar gösterilmesini engelle
-if 'warning_shown' not in st.session_state:
-    st.session_state.warning_shown = False
+# Sayfa Başlığı
+st.set_page_config(page_title="Sephora Marka Filtre Çekici", layout="wide")
+st.title("💄 Sephora Marka Filtre Veri Çekici (HTML Yükleme)")
+st.caption("Kaydettiğiniz Sephora ürün listeleme sayfası HTML dosyasını yükleyerek marka filtresindeki verileri CSV olarak indirin.")
 
-def extract_brand_filters_from_payload(html_content):
-    """
-    Parses the uploaded HTML content by finding the main data payload
-    (likely within self.__next_f.push) and extracting brand filters from it.
-
-    Args:
-        html_content (str): The HTML content as a string.
-
-    Returns:
-        list: A list of dictionaries, where each dictionary contains 'Brand' and 'Count'.
-              Returns an empty list if no data is found or an error occurs.
-    """
-    st.session_state.warning_shown = False # Her yeni çalıştırmada uyarı durumunu sıfırla
-    brands_data = []
-    script_payload_raw = ""
-    cleaned_payload = ""
-
-    try:
-        soup = BeautifulSoup(html_content, 'html.parser')
-        scripts = soup.find_all('script')
-
-        # 1. Adım: self.__next_f.push([1,"..."]) içeren script'i bul ve payload'ı çıkar
-        payload_found = False
-        for script in scripts:
-            if script.string and 'self.__next_f.push([1,"' in script.string:
-                payload_match = re.search(r'self\.__next_f\.push\(\[1,"(.*)"\]\)', script.string, re.DOTALL | re.S)
-                if payload_match:
-                    script_payload_raw = payload_match.group(1)
-                    payload_found = True
-                    # st.write("DEBUG: Found self.__next_f.push payload.") # Hata ayıklama
-                    break
-
-        if not payload_found:
-            st.warning("Could not find the 'self.__next_f.push([1,\"...\"])' script structure containing the page data.")
-            st.session_state.warning_shown = True
-            return []
-
-        # 2. Adım: Payload string'ini temizle (kaçış karakterleri vb.)
-        try:
-            # Öncelik sırası önemli: Önce \\" sonra \" temizle
-            cleaned_payload = script_payload_raw.replace('\\\\"', "'") # Çift kaçışlı tırnakları geçici olarak tek tırnak yap
-            cleaned_payload = cleaned_payload.replace('\\"', '"')      # Tek kaçışlıları çift tırnak yap
-            cleaned_payload = cleaned_payload.replace("'","\"")        # Geçici tek tırnakları çift tırnak yap (label'lar için)
-            cleaned_payload = cleaned_payload.replace('\\n', ' ')     # Yeni satırları boşluk yap
-            cleaned_payload = cleaned_payload.replace('\\\\', '\\')   # Çift ters eğik çizgiyi tek yap
-
-            # JSON olmayan referansları ($ ile başlayan) string'e çevir (regex'lerin çalışması için kritik)
-            # ":$XXX" -> ":\"$XXX\""
-            cleaned_payload = re.sub(r':(\$L?[0-9a-zA-Z]+)([,}])', r':"\1"\2', cleaned_payload)
-            # [$LXXX] -> ["$LXXX"]
-            cleaned_payload = re.sub(r'\[(\$L?[0-9a-zA-Z]+)\]', r'["\1"]', cleaned_payload)
-
-            # st.write("DEBUG: Cleaned Payload Snippet:") # Hata ayıklama
-            # st.code(cleaned_payload[:1500] + "...", language='text')
-        except Exception as clean_e:
-             st.warning(f"Error during payload cleaning: {clean_e}. Proceeding with raw payload for regex.")
-             st.session_state.warning_shown = True
-             cleaned_payload = script_payload_raw # Temizleme başarısız olursa ham veriyle devam etmeyi dene
-
-        # 3. Adım: Temizlenmiş payload içinde bireysel marka tanımlarını ("63":{"hitCount":..., "label":...}) bul
-        individual_brand_defs = {}
-        # Label içinde kaçış karakterlerini de yakalayacak şekilde güncellendi: ((?:[^"\\]|\\.)*)
-        brand_def_pattern = re.compile(r'"(\d+)"\s*:\s*\{\s*"hitCount"\s*:\s*(\d+)\s*,\s*"label"\s*:\s*"((?:[^"\\]|\\.)*)"')
-        all_defs = brand_def_pattern.findall(cleaned_payload)
-
-        if not all_defs:
-             st.warning("Found the data payload, but could not extract individual brand definitions (e.g., '63':{'hitCount':...}) using regex. The data format might be different or cleaning might have failed.")
-             st.session_state.warning_shown = True
-             return []
-        # else:
-        #      st.write(f"DEBUG: Found {len(all_defs)} potential brand definitions in the payload.") # Hata ayıklama
-
-        for key, count, label in all_defs:
-            # Temizlenmiş payload'da \\" kalmadığı için tekrar replace'e gerek yok
-            individual_brand_defs[key] = {'Brand': label.strip(), 'Count': int(count)}
-
-        # 4. Adım: "Brands" filtresinin referans anahtarını ("$62" gibi) temizlenmiş payload'da bul
-        brand_filter_ref_key = None
-        # Desen: "attributeId":"c_brand", ... "values":"$62"
-        brand_filter_ref_pattern = re.compile(r'"attributeId"\s*:\s*"c_brand"\s*,\s*"label"\s*:\s*"Brands"\s*,\s*"values"\s*:\s*"\$(\d+)"')
-        ref_match = brand_filter_ref_pattern.search(cleaned_payload)
-        if ref_match:
-            brand_filter_ref_key = ref_match.group(1) # Sadece sayısal kısmı ('62') al
-            # st.write(f"DEBUG: Found brand filter reference key: ${brand_filter_ref_key}")
-        else:
-            st.warning("Could not find the 'Brands' filter definition structure with a reference value (e.g., 'values':'$62') within the data payload.")
-            st.session_state.warning_shown = True
-            return []
-
-        # 5. Adım: Referans anahtarının tanımladığı array'i ("62":[...]) temizlenmiş payload'da bul
-        brands_array_str = None
-        brand_keys_in_array = []
-        # Anahtarın tırnak içinde olduğunu varsayarak deseni oluştur: "62" : [...]
-        ref_definition_pattern = re.compile(rf'"{brand_filter_ref_key}"\s*:\s*(\[.*?\])', re.DOTALL)
-        def_match = ref_definition_pattern.search(cleaned_payload)
-        if def_match:
-            brands_array_str = def_match.group(1)
-            # st.write(f"DEBUG: Found definition array for key {brand_filter_ref_key}.")
-            # Array içindeki asıl marka anahtarlarını ("$63", "$64" -> "63", "64") çıkar
-            brand_keys_in_array = re.findall(r'"\$(\d+)"', brands_array_str)
-            if not brand_keys_in_array:
-                 st.warning(f"Found the definition array for key {brand_filter_ref_key}, but failed to extract individual brand reference keys (e.g., '$63') from it.")
-                 # st.code(brands_array_str, language='text') # Hata ayıklama
-                 st.session_state.warning_shown = True
-                 return []
-            # else:
-            #      st.write(f"DEBUG: Extracted {len(brand_keys_in_array)} brand keys: {brand_keys_in_array[:10]}...")
-        else:
-            st.warning(f"Found brand filter reference key ${brand_filter_ref_key}, but couldn't find its corresponding definition array '[\"...']' in the data payload.")
-            st.session_state.warning_shown = True
-            return []
-
-        # 6. Adım: Çıkarılan anahtarları kullanarak marka verisini oluştur
-        missing_keys_count = 0
-        for key in brand_keys_in_array:
-            if key in individual_brand_defs:
-                brands_data.append(individual_brand_defs[key])
-            else:
-                missing_keys_count += 1
-                # st.warning(f"DEBUG: Definition for referenced brand key '{key}' was not found.") # Hata ayıklama
-
-        if missing_keys_count > 0:
-             st.warning(f"{missing_keys_count} out of {len(brand_keys_in_array)} brand definitions could not be matched to their keys. The result might be incomplete.")
-             st.session_state.warning_shown = True
-
-        if not brands_data:
-             st.warning("Successfully parsed the structure and keys, but couldn't match any keys to their definitions.")
-             st.session_state.warning_shown = True
-             return []
-
-        # Alfabetik olarak sırala
-        brands_data.sort(key=lambda x: x['Brand'])
-
-    except Exception as e:
-        st.error(f"An unexpected error occurred during processing: {e}")
-        st.error(traceback.format_exc()) # Daha detaylı hata çıktısı için
-        st.session_state.warning_shown = True
-        return []
-
-    return brands_data
-
-# --- Streamlit App UI ---
-st.set_page_config(layout="wide")
-st.title("🛍️ Sephora PLP Brand Filter Extractor")
-
-st.write("""
-Upload an HTML file saved directly from a Sephora Product Listing Page (PLP)
-(e.g., Makeup, Skincare categories). This app will attempt to extract the
-'Brands' filter data and provide it as a downloadable CSV file.
+# --- Kullanıcı Talimatları ---
+st.info("""
+**Nasıl Kullanılır:**
+1.  Marka filtrelerini çekmek istediğiniz Sephora ürün listeleme sayfasını (örn: Makyaj, Parfüm kategorisi) **web tarayıcınızda** açın.
+2.  Sayfanın **tamamen** yüklendiğinden emin olun (tüm ürünler ve filtreler görünür olmalı).
+3.  Tarayıcıda sayfaya sağ tıklayın ve **"Farklı Kaydet" (Save Page As...)** seçeneğini seçin.
+4.  Kayıt türü olarak **"Web Sayfası, Sadece HTML" (Webpage, HTML Only)** veya benzeri bir seçeneği seçin (Tüm sayfayı değil, sadece HTML'i kaydettiğinizden emin olun). Dosya uzantısı `.html` veya `.htm` olmalıdır.
+5.  Kaydettiğiniz bu `.html` dosyasını aşağıdaki "Gözat" düğmesini kullanarak yükleyin.
 """)
 
-uploaded_file = st.file_uploader("Choose a Sephora PLP HTML file", type=["html", "htm"])
+# --- Fonksiyonlar (Öncekiyle Büyük Ölçüde Aynı, fetch_* fonksiyonları kaldırıldı) ---
+
+def find_brand_filter(data):
+    """Recursive olarak JSON/dictionary içinde 'attributeId': 'c_brand' arar."""
+    if isinstance(data, dict):
+        if data.get('attributeId') == 'c_brand' and 'values' in data:
+            if data.get('values') and isinstance(data['values'], list) and all(isinstance(item, dict) for item in data['values']):
+                 return data
+        # 'image' gibi büyük/gereksiz alanları atla (performans)
+        for key, value in data.items():
+            if key not in ['image', 'images', 'icon', 'icons', 'banner', 'banners', 'variations', 'attributes', 'promotions']:
+                result = find_brand_filter(value)
+                if result:
+                    return result
+    elif isinstance(data, list):
+        # Çok uzun listelerde aramayı sınırlayabiliriz (opsiyonel)
+        # items_to_check = data[:1000] if len(data) > 1000 else data
+        items_to_check = data
+        for item in items_to_check:
+            result = find_brand_filter(item)
+            if result:
+                return result
+    return None
+
+def extract_brands_directly(soup):
+    """Alternatif yöntem: Doğrudan HTML elementlerini parse etmeye çalışır."""
+    st.info("Alternatif yöntem (HTML elementleri) deneniyor...")
+    brands_data = []
+    extracted_brands = set()
+    try:
+        # 'Brands' başlığını veya filtre bölümünü bul
+        # Daha genel class isimleri veya yapısal ipuçları ara
+        brand_section = None
+        possible_headers = soup.find_all(['h3', 'h2', 'button', 'div'], string=re.compile(r'Brands?', re.IGNORECASE))
+        for header in possible_headers:
+            # Başlığın parent'larını kontrol et, filtre elemanları içeriyor mu?
+            current = header
+            for _ in range(5): # 5 seviye yukarı bak
+                parent = current.find_parent(['div', 'section', 'aside'], class_=re.compile(r'filter|facet|refine', re.IGNORECASE))
+                if parent and parent.find(['input', 'label'], class_=re.compile(r'checkbox|facet-value', re.IGNORECASE)):
+                     brand_section = parent
+                     st.info(f"Başlıktan potansiyel filtre bölümü bulundu: <{brand_section.name} class='{brand_section.get('class', [])}'>")
+                     break
+                if not parent: break
+                current = parent
+            if brand_section: break # İlk bulduğumuzla devam et
+
+        if not brand_section:
+            st.warning("Marka başlığından filtre bölümü bulunamadı. Genel container araması yapılıyor...")
+            possible_sections = soup.find_all('div', class_=re.compile(r'filter|facet|refine', re.IGNORECASE))
+            for section in possible_sections:
+                 # İçinde 'brand' kelimesi geçen input veya çok sayıda potansiyel filtre değeri var mı?
+                 if section.find('input', attrs={'name': re.compile(r'brand', re.IGNORECASE)}) or \
+                    len(section.find_all(['label', 'li', 'div'], class_=re.compile(r'checkbox|facet-value|option', re.IGNORECASE))) > 3:
+                    brand_section = section
+                    st.info(f"Genel aramada potansiyel filtre bölümü bulundu: <{brand_section.name} class='{brand_section.get('class', [])}'>")
+                    break
+
+        if not brand_section:
+            st.error("Marka filtresi bölümü HTML içinde bulunamadı (Alternatif Yöntem).")
+            return None
+
+        # Marka item'larını veya label'larını bul (daha geniş class araması)
+        brand_items = brand_section.find_all(['div', 'li', 'label'], class_=re.compile(r'checkbox|facet-value|filter-value|facet-label|option', re.IGNORECASE))
+
+        if not brand_items:
+             # Sadece input'ları bulup parent'larından text almayı dene
+             inputs = brand_section.find_all('input', type='checkbox', attrs={'name': re.compile(r'brand', re.IGNORECASE)})
+             brand_items = [inp.find_parent('label') or inp.find_parent('div') for inp in inputs] # Parent label veya div ara
+             brand_items = [item for item in brand_items if item] # None olanları kaldır
+
+        if not brand_items:
+            st.error("Marka listesi elementleri (item/label/input parent) bulunamadı.")
+            return None
+
+        st.info(f"Bulunan olası marka elementi sayısı: {len(brand_items)}")
+
+        for item in brand_items:
+            text_content = item.get_text(separator=' ', strip=True)
+            # Regex: Başında potansiyel ikon/boşluk olabilecek Marka Adı (Sayı) veya Marka Adı Sayı
+            match = re.search(r'^(?:[\W\s]*)?([a-zA-Z0-9 &\'\+.-]+?)\s*\(?(\d+)\)?$', text_content)
+            if match:
+                brand_name = match.group(1).strip()
+                count = int(match.group(2))
+                if brand_name.lower() not in ['no', 'yes', ''] and brand_name not in extracted_brands:
+                    brands_data.append({'Marka': brand_name,'Ürün Sayısı': count})
+                    extracted_brands.add(brand_name)
+
+        if brands_data:
+            st.success(f"{len(brands_data)} marka verisi doğrudan HTML'den başarıyla çekildi (Alternatif Yöntem).")
+            return pd.DataFrame(brands_data)
+        else:
+            st.warning("Doğrudan HTML taramasında yapısal marka verisi bulunamadı veya ayıklanamadı.")
+            return None
+
+    except Exception as e:
+        st.error(f"Markaları doğrudan HTML'den çekerken hata oluştu (Alternatif Yöntem): {e}")
+        return None
+
+
+def extract_brands_from_html(html_content):
+    """HTML içeriğinden marka verilerini çıkarır (__NEXT_DATA__ öncelikli)."""
+    if not html_content:
+        st.error("HTML içeriği boş veya okunamadı.")
+        return None
+
+    soup = BeautifulSoup(html_content, 'lxml')
+    brands_data = []
+    processed_brands = set() # Yinelenenleri önlemek için
+
+    # 1. __NEXT_DATA__ script'ini bul ve işle
+    script_tag = soup.find('script', id='__NEXT_DATA__')
+    if script_tag:
+        st.info("__NEXT_DATA__ script'i bulundu, JSON verisi işleniyor...")
+        try:
+            next_data = json.loads(script_tag.string)
+            brand_filter = find_brand_filter(next_data) # Recursive arama
+
+            if brand_filter and 'values' in brand_filter and isinstance(brand_filter['values'], list):
+                for item in brand_filter['values']:
+                    if isinstance(item, dict) and 'label' in item and 'hitCount' in item:
+                         brand_name = item['label'].strip()
+                         # 'No' ve boş etiketleri ve tekrarları atla
+                         if brand_name and brand_name.lower() != 'no' and brand_name not in processed_brands:
+                            brands_data.append({
+                                'Marka': brand_name,
+                                'Ürün Sayısı': item.get('hitCount', 0) # hitCount yoksa 0
+                            })
+                            processed_brands.add(brand_name)
+
+                if brands_data:
+                     st.success(f"{len(brands_data)} marka verisi __NEXT_DATA__ içinden başarıyla çekildi.")
+                     return pd.DataFrame(brands_data)
+                else:
+                     st.warning("__NEXT_DATA__ içinde marka filtresi ('c_brand') bulundu ancak geçerli marka/sayı çifti yoktu. Alternatif yöntem deneniyor...")
+            else:
+                st.warning("__NEXT_DATA__ içinde 'c_brand' filtresi bulunamadı. Alternatif yöntem deneniyor...")
+        except Exception as e:
+            st.error(f"__NEXT_DATA__ işlenirken hata: {e}. Alternatif yöntem deneniyor...")
+    else:
+        st.warning("__NEXT_DATA__ script'i bulunamadı. Alternatif yöntem (doğrudan HTML tarama) deneniyor...")
+
+    # 2. Alternatif Yöntem: Doğrudan HTML'den çekmeyi dene
+    return extract_brands_directly(soup)
+
+
+# --- Streamlit Arayüzü ---
+uploaded_file = st.file_uploader(
+    "Kaydedilmiş Sephora HTML Dosyasını Yükleyin (.html/.htm)",
+    type=["html", "htm"],
+    accept_multiple_files=False
+)
 
 if uploaded_file is not None:
-    try:
-        # Decode with potential fallback and ignoring errors
-        string_data = uploaded_file.getvalue().decode("utf-8", errors='ignore')
-    except Exception as e:
-            st.error(f"Could not decode the uploaded file. Error: {e}")
-            st.stop() # Stop processing if file cannot be read
+    st.success(f"'{uploaded_file.name}' başarıyla yüklendi.")
+    with st.spinner("HTML dosyası okunuyor ve markalar ayrıştırılıyor..."):
+        try:
+            # Dosya içeriğini oku ve decode et
+            html_content = uploaded_file.getvalue().decode("utf-8")
+            st.info("HTML içeriği okundu.")
 
-    st.info("Processing uploaded HTML file...")
-    extracted_data = extract_brand_filters_from_payload(string_data) # Yeni fonksiyonu çağır
+            # Markaları çıkar
+            df_brands = extract_brands_from_html(html_content)
 
-    if extracted_data:
-        st.success(f"Successfully extracted {len(extracted_data)} brands!")
-        df = pd.DataFrame(extracted_data)
-        # DataFrame'i gösterirken sütun sırasını kontrol et
-        if 'Brand' in df.columns and 'Count' in df.columns:
-            st.dataframe(df[['Brand', 'Count']], use_container_width=True) # Sütun sırasını zorla
-        else:
-             st.warning("Extracted data columns might be incorrect.")
-             st.dataframe(df, use_container_width=True) # Orijinal haliyle göster
+            if df_brands is not None and not df_brands.empty:
+                st.subheader("Çekilen Marka Verileri")
+                # DataFrame'i gösterirken indeksi gizle
+                st.dataframe(df_brands.set_index('Marka'), use_container_width=True)
 
-        # CSV oluşturma
-        csv_buffer = io.StringIO()
-        # Sütunların varlığını tekrar kontrol et
-        if 'Brand' in df.columns and 'Count' in df.columns:
-            df.to_csv(csv_buffer, index=False, columns=['Brand', 'Count'], encoding='utf-8-sig')
-        else:
-             df.to_csv(csv_buffer, index=False, encoding='utf-8-sig') # Orijinal sütunlarla yaz
+                # --- CSV İndirme ---
+                try:
+                    csv_buffer = StringIO()
+                    df_brands.to_csv(csv_buffer, index=False, encoding='utf-8') # UTF-8 iyidir
+                    csv_data = csv_buffer.getvalue()
 
-        csv_string = csv_buffer.getvalue()
+                    # Yüklenen dosya adından CSV adı türet
+                    base_filename = os.path.splitext(uploaded_file.name)[0]
+                    csv_filename = f"sephora_markalar_{base_filename}.csv"
 
-        st.download_button(
-           label="Download Brand Data as CSV",
-           data=csv_string,
-           file_name='sephora_brands_filter.csv',
-           mime='text/csv',
-        )
-    # Fonksiyon içinde zaten uyarı gösterilmediyse
-    elif not st.session_state.warning_shown:
-         st.warning("No brand filter data was ultimately extracted. Please ensure the uploaded file is a complete HTML source from a Sephora PLP page containing the necessary script data.")
+                    st.download_button(
+                        label="💾 CSV Olarak İndir",
+                        data=csv_data,
+                        file_name=csv_filename,
+                        mime='text/csv',
+                    )
+                except Exception as e:
+                    st.error(f"CSV oluşturulurken veya indirme butonu hazırlanırken hata: {e}")
 
-# Reset warning state if file is removed
-if uploaded_file is None and st.session_state.warning_shown:
-    st.session_state.warning_shown = False
+            elif df_brands is not None: # Boş DataFrame döndü
+                 st.warning("Yüklenen HTML dosyasında marka filtresi verisi bulunamadı veya ayıklanamadı. Lütfen HTML'i 'Sadece HTML' olarak doğru kaydettiğinizden ve sayfanın tam yüklendiğinden emin olun.")
+            # else: extract_brands_from_html içinde zaten hata mesajı verildi.
+
+        except UnicodeDecodeError:
+            st.error("Dosya UTF-8 formatında okunamadı. Lütfen dosyayı tarayıcıdan 'Farklı Kaydet -> Web Sayfası, Sadece HTML' seçeneği ile tekrar kaydedip deneyin.")
+        except Exception as e:
+            st.error(f"Dosya işlenirken beklenmedik bir hata oluştu: {e}")
+
+st.markdown("---")
+st.caption("Not: Bu uygulama, yüklediğiniz HTML dosyasının içindeki verilere dayanır. En iyi sonuç için sayfayı tarayıcıda 'Farklı Kaydet -> Web Sayfası, Sadece HTML' olarak kaydedin.")
