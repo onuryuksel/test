@@ -1,139 +1,74 @@
 import streamlit as st
 import pandas as pd
 import re
-import json # Sadece hata durumunda JSON ayrıştırmayı denemek için kullanılabilir
-from bs4 import BeautifulSoup # Artık ana ayrıştırma için kullanılmayacak ama güvenlik için kalabilir
-import io
+import requests
 
-st.set_page_config(page_title="Sephora Marka Çıkarıcı", layout="wide")
+st.set_page_config(page_title="Brand Counter", layout="centered")
 
-st.title("💄 Sephora Marka Filtresi Veri Çıkarıcı")
-st.write("Lütfen Sephora ürün listeleme sayfasının indirilmiş HTML dosyasını yükleyin.")
-st.caption("Örnek dosya: 'Makeup Essentials_ Lips, Eyes & Skin ≡ Sephora.html'")
+st.title("Brand & Count Extractor (Sephora PLP URL)")
 
-def looks_like_brand(label: str) -> bool:
-    """
-    Verilen metnin bir marka ismine benzeyip benzemediğini kontrol eder.
-    (Harf içermeli, rakam içermemeli gibi basit kurallar)
-    """
-    if not label:
-        return False
-    # En az bir harf içermeli
-    has_letter = any(c.isalpha() for c in label)
-    # Rakam içermemeli (Marka isimlerinde genelde olmaz)
-    has_digit = any(c.isdigit() for c in label)
-    # Çok kısa olmamalı (Tek harfli markalar nadirdir)
-    is_long_enough = len(label) > 1
-    # Belki sadece büyük harf kontrolü? (Bu siteye özel olabilir, isteğe bağlı)
-    # is_mostly_upper = label.isupper() or not any(c.islower() for c in label if c.isalpha())
+st.write(
+    "🎯 **Paste a Sephora product‑listing (PLP) URL** below and click *Fetch & Parse*.\n"
+    "The app will download the HTML on your behalf, extract one row per brand with its product count, and let you download a CSV. "
+)
 
-    # return has_letter and not has_digit and is_long_enough and is_mostly_upper
-    return has_letter and not has_digit and is_long_enough
+# --- URL input ---------------------------------------------------------------------------
+plp_url = st.text_input("Sephora PLP URL", placeholder="https://www.sephora.xx/...", label_visibility="visible")
 
-def extract_brands_from_html_text(html_text):
-    """
-    Parses HTML content as plain text, finds brand/count pairs using regex directly
-    within escaped JavaScript string literals, filters, and deduplicates.
+# --- Fetch + Parse button ----------------------------------------------------------------
+if st.button("Fetch & Parse", disabled=not plp_url.strip()):
+    if not plp_url.lower().startswith("http"):
+        st.error("Please enter a valid URL starting with http/https.")
+    else:
+        try:
+            with st.spinner("Downloading page …"):
+                resp = requests.get(
+                    plp_url,
+                    headers={"User-Agent": "Mozilla/5.0 (compatible; BrandCounterBot/1.0)"},
+                    timeout=15,
+                )
+                resp.raise_for_status()
+                html_text = resp.text
+        except requests.exceptions.RequestException as e:
+            st.error(f"Error fetching the URL: {e}")
+            st.stop()
 
-    Args:
-        html_text (str): The HTML content as a string.
+        # -------- Extract brand data from embedded JSON ------------------------------
+        pattern = r'\\"hitCount\\":\s*(\d+),\\"label\\":\\"([^"\\]+)\\"'
+        matches = re.findall(pattern, html_text)
 
-    Returns:
-        tuple: A tuple containing (list of brand dictionaries, list of headers)
-               or (None, None) if data extraction fails.
-    """
-    brands_data = []
-    fieldnames = ['Marka', 'Urun Adedi']
-
-    # Regex: Kaçış karakterli tırnakları içeren "hitCount": sayı , "label":"marka" kalıbını ara
-    # Grup 1: Sayı (\d+)
-    # Grup 2: Marka adı ([^"\\]+) - Tırnak veya ters eğik çizgi olmayan karakterler
-    pattern = re.compile(r'\\"hitCount\\"\s*:\s*(\d+)\s*,*\s*\\"label\\"\s*:\s*\\"([^"\\]+)\\"', re.IGNORECASE)
-    # Alternatif (label önce gelirse):
-    pattern_alt = re.compile(r'\\"label\\"\s*:\s*\\"([^"\\]+)\\"\s*,*\s*\\"hitCount\\"\s*:\s*(\d+)', re.IGNORECASE)
-
-
-    st.write("HTML metni içinde marka/ürün sayısı çiftleri aranıyor...")
-    matches = pattern.findall(html_text)
-    matches_alt = pattern_alt.findall(html_text)
-
-    st.info(f"İlk desenle {len(matches)} eşleşme, ikinci desenle {len(matches_alt)} eşleşme bulundu.")
-
-    # İki desenden gelen sonuçları birleştir (label, count sırasında)
-    all_potential_matches = []
-    if matches:
-        # (count, label) formatında, (label, count) formatına çevir
-        all_potential_matches.extend([(label, count_str) for count_str, label in matches])
-    if matches_alt:
-         # Zaten (label, count) formatında
-        all_potential_matches.extend([(label, count_str) for label, count_str in matches_alt])
-
-    st.write(f"Toplam {len(all_potential_matches)} potansiyel eşleşme işleniyor...")
-
-    brand_totals: dict[str, int] = {}
-    processed_count = 0
-    skipped_count = 0
-
-    for label, count_str in all_potential_matches:
-        # Heuristic filtrelemeyi uygula
-        if looks_like_brand(label):
-            try:
-                count = int(count_str)
-                processed_count += 1
-                # Tekilleştirme ve maksimum sayıyı tutma
-                brand_name = label.strip() # Başındaki/sonundaki boşlukları temizle
-                brand_totals[brand_name] = max(brand_totals.get(brand_name, 0), count)
-            except ValueError:
-                skipped_count += 1
-                # st.warning(f"Sayıya dönüştürülemedi: '{count_str}' (Marka: '{label}')") # Debug
-        else:
-            skipped_count += 1
-            # st.write(f"Markaya benzemediği için atlandı: '{label}'") # Debug
-
-    st.write(f"{processed_count} olası marka işlendi, {skipped_count} tanesi filtreye takıldı/hatalıydı.")
-
-    if not brand_totals:
-        st.error("Regex ile eşleşen ve marka filtresine uyan veri bulunamadı. HTML kaynağını kontrol edin veya regex desenini/filtreleme kurallarını gözden geçirin.")
-        return None, None
-
-    # Sözlüğü listeye çevir
-    brands_data = [{"Marka": brand, "Urun Adedi": count} for brand, count in brand_totals.items()]
-
-    st.info(f"Toplam {len(brands_data)} benzersiz marka bulundu.")
-    return brands_data, fieldnames
-
-# --- Streamlit File Uploader ---
-uploaded_file = st.file_uploader("HTML Dosyasını Buraya Sürükleyin veya Seçin", type=["html", "htm"])
-
-if uploaded_file is not None:
-    try:
-        # Dosyayı doğrudan metin olarak oku
-        html_content = uploaded_file.getvalue().decode("utf-8", errors="ignore")
-        st.success(f"'{uploaded_file.name}' başarıyla yüklendi ve okundu.")
-
-        with st.spinner("Marka verileri çıkarılıyor..."):
-            # Yeni fonksiyonu çağır
-            brands_data, headers = extract_brands_from_html_text(html_content)
-
-        if brands_data and headers:
-            st.success("Marka verileri başarıyla çıkarıldı!")
-            df = pd.DataFrame(brands_data)
-            # Markaya göre sırala
-            df = df.sort_values(by='Marka').reset_index(drop=True)
-            st.dataframe(df, use_container_width=True)
-            csv_string = df.to_csv(index=False, encoding='utf-8-sig') # Excel uyumluluğu için
-            st.download_button(
-               label="CSV Olarak İndir",
-               data=csv_string,
-               file_name='sephora_markalar.csv',
-               mime='text/csv',
+        def looks_like_brand(label: str) -> bool:
+            return (
+                any(c.isalpha() for c in label)  # has letters
+                and not re.search(r'\d', label)  # exclude numeric labels/SKUs
+                and not any(c.islower() for c in label)  # brand labels appear upper‑case in this blob
             )
-        # else: # Hata mesajı zaten fonksiyon içinde veriliyor
 
-    except UnicodeDecodeError:
-        st.error("Dosya kodlaması UTF-8 değil gibi görünüyor. Lütfen UTF-8 formatında kaydedilmiş bir HTML dosyası yükleyin.")
-    except Exception as e:
-        st.error(f"Dosya işlenirken genel bir hata oluştu: {e}")
-        st.exception(e) # Detaylı hata izi için
-else:
-    st.info("HTML dosyası bekleniyor...")
+        brand_totals: dict[str, int] = {}
+        for count_str, label in matches:
+            if not looks_like_brand(label):
+                continue
+            count = int(count_str)
+            # Dedup logic: keep max count if label repeats
+            brand_totals[label] = max(count, brand_totals.get(label, 0))
+
+        if not brand_totals:
+            st.warning("No brands detected – make sure you're using a PLP URL that contains the brand filter JSON.")
+            st.stop()
+
+        df = pd.DataFrame(sorted(brand_totals.items()), columns=["Brand", "Count"]).reset_index(drop=True)
+
+        st.success(f"Found {len(df)} unique brands! ✨")
+        st.dataframe(df, use_container_width=True)
+
+        # CSV download button
+        csv_bytes = df.to_csv(index=False, encoding="utf-8").encode("utf-8")
+        st.download_button(
+            "Download CSV",
+            data=csv_bytes,
+            file_name="brand_counts.csv",
+            mime="text/csv",
+        )
+
+# --- Footer -----------------------------------------------------------------------------
+st.caption("Built with ❤ using Streamlit.")
