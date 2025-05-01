@@ -10,7 +10,7 @@ import time
 
 # Sayfa Başlığı
 st.set_page_config(page_title="Sephora Marka Filtre Çekici", layout="wide")
-st.title("💄 Sephora Marka Filtre Veri Çekici")
+st.title("💄 Sephora Marka Filtre Veri Çekici 4")
 st.caption("Sephora ürün listeleme sayfası linkini girerek marka filtresindeki verileri CSV olarak indirin.")
 
 # --- Fonksiyonlar ---
