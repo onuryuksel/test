@@ -5,7 +5,7 @@ import pandas as pd
 import re
 import json
 from io import StringIO
-import time # Küçük bir gecikme ekleyebiliriz
+import time # Gerekirse gecikme eklemek için
 
 # Sayfa Başlığı
 st.set_page_config(page_title="Sephora Marka Filtre Çekici", layout="wide")
@@ -18,9 +18,8 @@ st.caption("Sephora ürün listeleme sayfası linkini girerek marka filtresindek
 def get_session():
     """Tek bir requests.Session nesnesi oluşturur."""
     session = requests.Session()
-    # Session için varsayılan header'ları ayarla
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36', # Daha güncel bir UA
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
         'Accept-Language': 'en-US,en;q=0.9,tr-TR;q=0.8,tr;q=0.7',
         'Accept-Encoding': 'gzip, deflate, br',
@@ -30,7 +29,7 @@ def get_session():
         'Sec-Fetch-Mode': 'navigate',
         'Sec-Fetch-Site': 'none',
         'Sec-Fetch-User': '?1',
-        'Sec-Ch-Ua': '"Not.A/Brand";v="8", "Chromium";v="114", "Google Chrome";v="114"', # Client Hints
+        'Sec-Ch-Ua': '"Not.A/Brand";v="8", "Chromium";v="114", "Google Chrome";v="114"',
         'Sec-Ch-Ua-Mobile': '?0',
         'Sec-Ch-Ua-Platform': '"Windows"',
         'Cache-Control': 'max-age=0',
@@ -39,28 +38,30 @@ def get_session():
     return session
 
 def fetch_html_requests(url):
-    """Verilen URL'den HTML içeriğini requests.Session ile çeker."""
+    """Verilen URL'den HTML içeriğini requests.Session ile çeker (Timeout artırıldı)."""
     session = get_session()
+    # Timeout süresini 60 saniyeye çıkaralım
+    timeout_seconds = 60
     try:
-        # time.sleep(0.5) # Çok nazik bir gecikme
-        response = session.get(url, timeout=20, allow_redirects=True) # Session objesi ile get isteği
+        # time.sleep(0.5)
+        st.info(f"URL alınıyor (Timeout={timeout_seconds}s)... Lütfen bekleyin.")
+        response = session.get(url, timeout=timeout_seconds, allow_redirects=True)
         response.raise_for_status()
 
         if not response.content:
              st.warning(f"URL'den boş içerik alındı: {url}. Sayfa yapısı veya engelleme sorunu olabilir.")
              return None
 
-        # İçeriği doğru şekilde decode et
         response.encoding = response.apparent_encoding or 'utf-8'
         st.success(f"URL başarıyla alındı (requests): {url}")
         return response.text
 
     except requests.exceptions.Timeout:
-        st.error(f"İstek zaman aşımına uğradı (Timeout=20s): {url}")
+        st.error(f"İstek zaman aşımına uğradı (Timeout={timeout_seconds}s): {url}")
+        st.info("Sunucu yanıt vermedi. Sunucu yoğun olabilir veya istek engelleniyor olabilir.")
         return None
     except requests.exceptions.HTTPError as e:
          st.error(f"HTTP Hatası: {e.response.status_code} {e.response.reason} - URL: {url}")
-         # st.error(f"Sunucu Yanıtı (ilk 500 karakter): {e.response.text[:500]}...")
          if e.response.status_code == 403:
               st.warning("403 Forbidden hatası alındı. Bu genellikle bot koruması anlamına gelir.")
          elif e.response.status_code >= 500:
@@ -68,7 +69,7 @@ def fetch_html_requests(url):
          return None
     except requests.exceptions.ConnectionError as e:
         st.error(f"Bağlantı Hatası: {e}")
-        st.info("Bu hata genellikle sunucunun isteği engellediği, geçici ağ sorunları olduğu veya URL'nin hatalı olduğu anlamına gelir. Lütfen URL'yi tarayıcıda kontrol edin.")
+        st.info("Bağlantı kurulamadı veya sunucu bağlantıyı kapattı. URL'yi kontrol edin veya ağ sorunlarını/engellemeleri değerlendirin.")
         return None
     except requests.exceptions.RequestException as e:
         st.error(f"Genel URL alınırken hata oluştu: {e}")
@@ -83,12 +84,15 @@ def find_brand_filter(data):
             if data['values'] and isinstance(data['values'], list) and all(isinstance(item, dict) for item in data['values']):
                  return data
         for key, value in data.items():
-            if key not in ['image', 'images', 'icon', 'icons', 'banner', 'banners']:
+            if key not in ['image', 'images', 'icon', 'icons', 'banner', 'banners', 'variations', 'attributes']: # Büyük listeleri/dict'leri atla
                 result = find_brand_filter(value)
                 if result:
                     return result
     elif isinstance(data, list):
-        for item in data:
+        # Listeyi küçültme (çok uzun listelerde performansı artırabilir - riskli)
+        # items_to_check = data[:500] if len(data) > 500 else data
+        items_to_check = data
+        for item in items_to_check:
             result = find_brand_filter(item)
             if result:
                 return result
@@ -99,39 +103,47 @@ def extract_brands_directly(soup):
     st.info("Alternatif yöntem: HTML elementleri taranıyor...")
     brands_data = []
     try:
-        brand_header = soup.find(['h3', 'h2', 'div'], string=re.compile(r'Brands', re.IGNORECASE))
-        if not brand_header:
-            st.warning("Doğrudan HTML'de 'Brands' başlığı bulunamadı. Daha genel filtre container'ları aranıyor...")
-            filter_containers = soup.find_all('div', class_=re.compile(r'filter-section|facet-container|refinement-options', re.IGNORECASE))
-            if not filter_containers:
-                 st.error("Marka filtresi bölümü HTML içinde bulunamadı (Alternatif Yöntem).")
-                 return None
-            brand_section = None
-            for container in filter_containers:
-                # Checkbox input'u içeren bir container ara
-                if container.find('input', type='checkbox', attrs={'name': re.compile(r'brand|Brand', re.IGNORECASE)}):
-                    brand_section = container
-                    st.info(f"Olası marka filtre container'ı bulundu: {container.get('class', 'N/A')}")
-                    break
-                # Veya doğrudan marka listesi gibi görünen bir yapı ara (örneğin, çok sayıda label içeren)
-                elif len(container.find_all('label', class_=re.compile(r'checkbox-label|facet-label', re.IGNORECASE))) > 5: # Eşik değeri ayarlanabilir
-                    brand_section = container
-                    st.info(f"Label içeren olası marka filtre container'ı bulundu: {container.get('class', 'N/A')}")
-                    break
-            if not brand_section:
-                 st.error("Checkbox/Label içeren marka filtresi container'ı bulunamadı.")
-                 return None
-        else:
-             brand_section = brand_header.find_parent('div', class_=re.compile(r'filter-section|facet-container|refinement-options', re.IGNORECASE))
-             if not brand_section: brand_section = brand_header.find_parent('div', recursive=False) # Doğrudan parent
-             if not brand_section: brand_section = brand_header.find_parent('div').find_parent('div') # İki üst parent
-             if not brand_section:
-                 st.error("Marka başlığından yola çıkarak filtre bölümü bulunamadı.")
-                 return None
-             st.info(f"Marka başlığından yola çıkarak filtre container'ı bulundu: {brand_section.get('class', 'N/A')}")
+        # 'Brands' başlığını veya benzerini bul
+        brand_header = soup.find(['h3', 'h2', 'div', 'button'], string=re.compile(r'Brands?', re.IGNORECASE))
 
-        # Marka item'larını/label'larını bul
-        brand_items = brand_section.find_all(['div', 'li', 'label'], class_=re.compile(r'checkbox-item|facet-value|filter-value|checkbox-label|facet-label', re.IGNORECASE))
+        # Filtre container'ını bul
+        brand_section = None
+        if brand_header:
+            # Başlıktan birkaç seviye yukarı çıkmayı dene
+            current = brand_header
+            for _ in range(5): # En fazla 5 seviye yukarı bak
+                 parent = current.find_parent(['div', 'section', 'aside'])
+                 if parent and parent.find(['input', 'label'], class_=re.compile(r'checkbox|facet', re.IGNORECASE)):
+                      brand_section = parent
+                      st.info(f"Başlıktan parent bulundu: <{brand_section.name} class='{brand_section.get('class', 'N/A')}'>")
+                      break
+                 if not parent: break # Daha fazla parent yoksa dur
+                 current = parent
+
+        # Eğer başlıktan bulunamazsa, genel filtre container'larını ara
+        if not brand_section:
+            st.warning("Marka başlığından filtre bölümü bulunamadı. Genel arama...")
+            # Checkbox içeren veya çok sayıda filtre değeri içeren div'leri ara
+            possible_sections = soup.find_all('div', class_=re.compile(r'filter|facet|refine', re.IGNORECASE))
+            for section in possible_sections:
+                # İçinde 'brand' geçen bir input veya çok sayıda checkbox/label var mı?
+                 if section.find('input', attrs={'name': re.compile(r'brand', re.IGNORECASE)}) or \
+                    len(section.find_all(['label', 'li', 'div'], class_=re.compile(r'checkbox|facet-value', re.IGNORECASE))) > 3: # Eşik değeri
+                    brand_section = section
+                    st.info(f"Genel aramada olası filtre bölümü bulundu: <{brand_section.name} class='{brand_section.get('class', 'N/A')}'>")
+                    break
+
+        if not brand_section:
+            st.error("Marka filtresi bölümü HTML içinde bulunamadı (Alternatif Yöntem).")
+            return None
+
+        # Marka item'larını bul (label veya input içeren div/li)
+        brand_items = brand_section.find_all(['div', 'li', 'label'], class_=re.compile(r'checkbox|facet-value|filter-value|facet-label', re.IGNORECASE))
+
+        if not brand_items:
+            # Sadece input'ları bulup parent'larından text almayı dene
+            inputs = brand_section.find_all('input', type='checkbox', attrs={'name': re.compile(r'brand', re.IGNORECASE)})
+            brand_items = [inp.parent for inp in inputs if inp.parent] # Parent'ları al
 
         if not brand_items:
             st.error("Marka listesi elementleri (item/label) bulunamadı.")
@@ -139,32 +151,25 @@ def extract_brands_directly(soup):
 
         st.info(f"Bulunan olası marka elementi sayısı: {len(brand_items)}")
 
+        extracted_brands = set() # Marka isimlerinin tekrarını önlemek için
         for item in brand_items:
             brand_name = ""
             count = 0
             text_content = item.get_text(separator=' ', strip=True)
-            match = re.search(r'^(.*?)\s*\((\d+)\)$', text_content) # Marka (Sayı) formatı
+
+            # Regex: Marka Adı (Sayı) veya Marka Adı Sayı
+            match = re.search(r'^(.*?)\s*\(?(\d+)\)?$', text_content)
             if match:
                 brand_name = match.group(1).strip()
                 count = int(match.group(2))
-                if brand_name.lower() == 'no' or not brand_name : continue
-                brands_data.append({'Marka': brand_name,'Ürün Sayısı': count})
-            else: # Belki sayı ayrı bir span'de
-                 brand_span = item.find(['label','span'], class_=re.compile(r'label|name', re.IGNORECASE))
-                 count_span = item.find('span', class_=re.compile(r'count|hitcount', re.IGNORECASE))
-                 if brand_span and count_span:
-                     brand_name = brand_span.get_text(strip=True)
-                     count_text = count_span.get_text(strip=True).strip('()[]') # Parantezleri temizle
-                     if count_text.isdigit():
-                         if brand_name.lower() == 'no' or not brand_name: continue
-                         brands_data.append({'Marka': brand_name, 'Ürün Sayısı': int(count_text)})
+                # Anlamsız isimleri filtrele
+                if brand_name.lower() not in ['no', 'yes', ''] and brand_name not in extracted_brands:
+                    brands_data.append({'Marka': brand_name,'Ürün Sayısı': count})
+                    extracted_brands.add(brand_name)
 
         if brands_data:
             st.success(f"{len(brands_data)} marka verisi doğrudan HTML'den başarıyla çekildi (Alternatif Yöntem).")
-            df = pd.DataFrame(brands_data)
-            df_unique = df.drop_duplicates(subset=['Marka'])
-            st.info(f"Yinelenenler kaldırıldıktan sonra {len(df_unique)} marka kaldı.")
-            return df_unique
+            return pd.DataFrame(brands_data) # Zaten unique olmalı ama emin olmak için drop_duplicates kullanılabilir
         else:
             st.warning("Doğrudan HTML taramasında yapısal marka verisi bulunamadı veya ayıklanamadı.")
             return None
@@ -172,6 +177,7 @@ def extract_brands_directly(soup):
     except Exception as e:
         st.error(f"Markaları doğrudan HTML'den çekerken hata oluştu (Alternatif Yöntem): {e}")
         return None
+
 
 def extract_brands_from_html(html_content):
     """HTML içeriğinden marka verilerini çıkarır (__NEXT_DATA__ öncelikli)."""
@@ -190,10 +196,13 @@ def extract_brands_from_html(html_content):
             brand_filter = find_brand_filter(next_data)
 
             if brand_filter and 'values' in brand_filter and isinstance(brand_filter['values'], list):
+                processed_brands = set()
                 for item in brand_filter['values']:
                     if isinstance(item, dict) and 'label' in item and 'hitCount' in item and item['label'] and item['hitCount'] is not None:
-                        if item['label'].strip().lower() != 'no':
-                             brands_data.append({'Marka': item['label'],'Ürün Sayısı': item['hitCount']})
+                        brand_name = item['label'].strip()
+                        if brand_name.lower() != 'no' and brand_name not in processed_brands:
+                             brands_data.append({'Marka': brand_name,'Ürün Sayısı': item['hitCount']})
+                             processed_brands.add(brand_name)
                 if brands_data:
                      st.success(f"{len(brands_data)} marka verisi __NEXT_DATA__ içinden başarıyla çekildi.")
                      return pd.DataFrame(brands_data)
@@ -206,11 +215,8 @@ def extract_brands_from_html(html_content):
     else:
         st.warning("__NEXT_DATA__ script'i bulunamadı. Alternatif yöntem deneniyor...")
 
-    # __NEXT_DATA__'dan veri alınamazsa veya boşsa, doğrudan HTML'den çekmeyi dene
-    if not brands_data:
-        return extract_brands_directly(soup)
-    else: # __NEXT_DATA__ bulundu ama boştu
-        return pd.DataFrame(brands_data)
+    # Alternatif Yöntem
+    return extract_brands_directly(soup)
 
 
 # --- Streamlit Arayüzü ---
@@ -222,11 +228,11 @@ if process_button and url:
          st.warning("Lütfen geçerli bir Sephora URL'si girin (http:// veya https:// ile başlamalıdır).")
     else:
         with st.spinner("Sayfa indiriliyor (requests) ve markalar çekiliyor... Lütfen bekleyin."):
-            # Önce requests ile dene
+            # Yeniden requests ile dene (uzun timeout ile)
             html_content = fetch_html_requests(url)
 
             if html_content:
-                df_brands = extract_brands_from_html(html_content) # HTML'i işle
+                df_brands = extract_brands_from_html(html_content)
 
                 if df_brands is not None and not df_brands.empty:
                     st.subheader("Çekilen Marka Verileri")
