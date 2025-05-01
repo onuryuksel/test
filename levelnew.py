@@ -1,189 +1,226 @@
 import streamlit as st
 import requests
 from bs4 import BeautifulSoup
+import pandas as pd
+import re
 import json
-import csv
-import io
+from io import StringIO  # CSV indirme için gerekli
 
-# --- Veri Çıkarma Fonksiyonu (Flask versiyonundan uyarlanmış) ---
-def extract_designers_from_url(url):
-    """
-    Verilen URL'den HTML'i çeker, __NEXT_DATA__ JSON'unu çıkarır
-    ve designer/brand filtresindeki verileri döndürür.
+# Sayfa Başlığı
+st.set_page_config(page_title="Sephora Marka Filtre Çekici", layout="wide")
+st.title("💄 Sephora Marka Filtre Veri Çekici")
+st.caption("Sephora ürün listeleme sayfası linkini girerek marka filtresindeki verileri CSV olarak indirin.")
 
-    Args:
-        url (str): Level Shoes PLP URL'si.
-
-    Returns:
-        list: Başarılı olursa [['Designer', 'Count'], ['Marka1', Sayı1], ...] listesi.
-        str: Hata veya uyarı mesajı.
-    """
+# --- Fonksiyonlar ---
+def fetch_html(url):
+    """Verilen URL'den HTML içeriğini çeker."""
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
     }
     try:
-        # Timeout ekleyerek isteği yap
-        response = requests.get(url, headers=headers, timeout=20)
-        response.raise_for_status() # HTTP hatalarını kontrol et
+        response = requests.get(url, headers=headers, timeout=15)
+        response.raise_for_status()  # HTTP hatalarını kontrol et (4xx veya 5xx)
+        return response.text
     except requests.exceptions.Timeout:
-        return "Hata: İstek zaman aşımına uğradı. URL'yi kontrol edin veya sonra tekrar deneyin."
+        st.error(f"İstek zaman aşımına uğradı: {url}")
+        return None
     except requests.exceptions.RequestException as e:
-        return f"Hata: URL alınırken bir sorun oluştu: {e}"
-    except Exception as e:
-        return f"Hata: Beklenmedik bir ağ hatası oluştu: {e}"
+        st.error(f"URL alınırken hata oluştu: {e}")
+        return None
+
+def extract_brands_from_html(html_content):
+    """
+    HTML içeriğinden __NEXT_DATA__ script'ini bularak marka verilerini çıkarır.
+    Sephora'nın Next.js kullandığı ve veriyi script tag'ine gömdüğü varsayılır.
+    """
+    if not html_content:
+        return None
+
+    soup = BeautifulSoup(html_content, 'lxml') # lxml parser kullanıyoruz
+    brands_data = []
+
+    # Next.js'in veri gömdüğü script tag'ini bul
+    script_tag = soup.find('script', id='__NEXT_DATA__')
+
+    if not script_tag:
+        st.warning("Sayfa yapısı beklenenden farklı. __NEXT_DATA__ script'i bulunamadı. Alternatif yöntem deneniyor...")
+        # Alternatif Yöntem: HTML içindeki filter yapısını arama (daha az güvenilir)
+        return extract_brands_directly(soup)
+
 
     try:
-        soup = BeautifulSoup(response.text, 'html.parser')
-        script_tag = soup.find('script', {'id': '__NEXT_DATA__'})
+        # Script içeriğini JSON olarak parse et
+        next_data = json.loads(script_tag.string)
+        # Veri yapısı değişebilir, doğru yolu bulmak için inspect gerekebilir.
+        # Örnek yapıda props.pageProps.initialState... gibi bir yol izlenebilir.
+        # Burada daha genel bir arama yapıyoruz.
 
-        if not script_tag:
-            return "Hata: Sayfa yapısı beklenenden farklı, '__NEXT_DATA__' bulunamadı."
+        # Çok katmanlı JSON içinde 'attributeId': 'c_brand' içeren objeyi bul
+        brand_filter = find_brand_filter(next_data)
 
-        json_data_str = script_tag.string
-        if not json_data_str:
-            return "Hata: __NEXT_DATA__ içeriği boş."
+        if brand_filter and 'values' in brand_filter:
+            for item in brand_filter['values']:
+                if 'label' in item and 'hitCount' in item and item['label'] and item['hitCount'] is not None:
+                    brands_data.append({
+                        'Marka': item['label'],
+                        'Ürün Sayısı': item['hitCount']
+                    })
+            st.success(f"{len(brands_data)} marka verisi __NEXT_DATA__ içinden başarıyla çekildi.")
+            return pd.DataFrame(brands_data)
+        else:
+            st.warning("__NEXT_DATA__ içinde marka filtresi bulunamadı. Alternatif yöntem deneniyor...")
+            return extract_brands_directly(soup)
 
-        data = json.loads(json_data_str)
-
-        # JSON yapısını güvenli bir şekilde gezin
-        apollo_state = data.get('props', {}).get('pageProps', {}).get('__APOLLO_STATE__', {})
-        root_query = apollo_state.get('ROOT_QUERY', {})
-
-        product_list_key = next((key for key in root_query if key.startswith('_productList')), None)
-
-        if not product_list_key:
-             # Alternatif anahtar yapısını deneyelim (Bazen anahtar ID içerebilir)
-             product_list_key = next((key for key in root_query if '_productList:({' in key), None)
-             if not product_list_key:
-                 st.json(root_query.keys()) # Hata ayıklama için anahtarları göster
-                 return "Hata: Gerekli ürün listesi verisi sayfada bulunamadı (product list key)."
-
-
-        facets = root_query.get(product_list_key, {}).get('facets', [])
-
-        designer_facet = None
-        for facet in facets:
-            # 'brand' veya 'designer' anahtarını arayalım
-            if facet.get('key') == 'brand' or facet.get('label', '').lower() == 'designer':
-                designer_facet = facet
-                break
-
-        if not designer_facet:
-            # Hata ayıklama için mevcut facet'leri gösterelim
-            available_facets = [f.get('key') or f.get('label') for f in facets]
-            st.write("Bulunan Filtre Anahtarları/Etiketleri:", available_facets)
-            return "Hata: Sayfada 'brand' veya 'Designer' filtresi bulunamadı."
-
-        designer_options = designer_facet.get('options', [])
-
-        if not designer_options:
-            return "Uyarı: Tasarımcı filtresinde hiç seçenek bulunamadı."
-
-        # CSV için veriyi hazırla
-        csv_data = [['Designer', 'Count']]
-        for option in designer_options:
-            name = option.get('name')
-            count = option.get('count')
-            if name is not None and count is not None:
-                csv_data.append([name, count])
-
-        if len(csv_data) <= 1:
-             return "Uyarı: Tasarımcı verisi bulundu ancak liste boş."
-
-        return csv_data
-
-    except json.JSONDecodeError:
-        return "Hata: Sayfadan alınan veri JSON formatında değil."
-    except (AttributeError, KeyError, TypeError, IndexError) as e:
-        st.error(f"İşleme hatası detayı: {e}") # Geliştirme için loglama
-        return "Hata: Sayfa yapısı değişmiş olabilir veya beklenmeyen bir veri yapısı ile karşılaşıldı."
+    except (json.JSONDecodeError, KeyError, TypeError) as e:
+        st.error(f"__NEXT_DATA__ parse edilirken hata: {e}. Alternatif yöntem deneniyor...")
+        return extract_brands_directly(soup)
     except Exception as e:
-        st.exception(e) # Geliştirme için tam hata izini göster
-        return f"Hata: Veri işlenirken beklenmedik bir sorun oluştu: {e}"
+         st.error(f"Markaları çekerken beklenmedik bir hata oluştu: {e}. Alternatif yöntem deneniyor...")
+         return extract_brands_directly(soup)
 
-# --- CSV Dönüştürme Fonksiyonu ---
-def convert_to_csv(data):
-    """Verilen listeyi CSV formatında string'e çevirir."""
-    output = io.StringIO()
-    writer = csv.writer(output)
-    writer.writerows(data)
-    return output.getvalue()
+def find_brand_filter(data):
+    """Recursive olarak JSON/dictionary içinde 'attributeId': 'c_brand' arar."""
+    if isinstance(data, dict):
+        if data.get('attributeId') == 'c_brand' and 'values' in data:
+            return data
+        for key, value in data.items():
+            result = find_brand_filter(value)
+            if result:
+                return result
+    elif isinstance(data, list):
+        for item in data:
+            result = find_brand_filter(item)
+            if result:
+                return result
+    return None
 
-# --- Streamlit Uygulama Arayüzü ---
-st.set_page_config(page_title="Level Shoes Extractor", layout="wide")
-st.title("👠 Level Shoes Designer Extractor")
-st.markdown("Bir Level Shoes Ürün Listeleme Sayfası (PLP) URL'si girin ve sayfadaki tasarımcı filtresi verilerini CSV olarak alın.")
 
-# Session state kullanarak önceki URL'yi ve veriyi sakla
-if 'submitted_url' not in st.session_state:
-    st.session_state.submitted_url = ""
-if 'designer_data' not in st.session_state:
-    st.session_state.designer_data = None
-if 'error_message' not in st.session_state:
-    st.session_state.error_message = None
+def extract_brands_directly(soup):
+    """
+    Alternatif yöntem: Doğrudan HTML elementlerini parse etmeye çalışır.
+    Bu yöntem sayfa yapısı değişirse kolayca bozulabilir.
+    """
+    st.info("Alternatif yöntem: HTML elementleri taranıyor...")
+    brands_data = []
+    # Tarayıcı Geliştirici Araçları ile filtre bölümünün container'ını ve
+    # marka/sayı elementlerini bulup uygun seçicileri belirlemek gerekir.
+    # Örnek (Bu seçiciler SADECE TAHMİNİDİR ve çalışmayabilir):
+    try:
+        # Marka filtresinin genel container'ını bulmaya çalışalım (class adı değişebilir)
+        # Genellikle 'Brands' başlığını içeren bir div'in kardeş veya ebeveyn elementi olabilir.
+        brand_section = soup.find('h3', string='Brands') # Veya 'h2', 'div' vb. olabilir
+        if not brand_section:
+             # Belki de input'ların olduğu bir div'i bulabiliriz
+             st.warning("Doğrudan HTML'de 'Brands' başlığı bulunamadı.")
+             filter_containers = soup.find_all('div', class_=re.compile(r'filter-section|facet-container')) # Regex ile olası class'ları ara
+             if not filter_containers:
+                 st.error("Marka filtresi bölümü HTML içinde bulunamadı (Alternatif Yöntem).")
+                 return None
 
-url = st.text_input(
-    "Level Shoes PLP URL:",
-    placeholder="https://www.levelshoes.com/...",
-    value=st.session_state.submitted_url,
-    key="url_input" # Tekrar renderlamada değeri korumak için anahtar
-)
+             # Bu container'lar içinde checkbox ve label'ları arayalım
+             for container in filter_containers:
+                 items = container.find_all('div', class_=re.compile(r'filter-item|facet-value')) # Örnek class adları
+                 if items:
+                      brand_section = container # İlk uygun container'ı alalım
+                      break
 
-col1, col2 = st.columns([1, 5]) # Butonlar için sütunlar
+        if not brand_section:
+             st.error("Marka filtresi bölümü HTML içinde bulunamadı (Alternatif Yöntem).")
+             return None
 
-with col1:
-    extract_button = st.button("Veriyi Çıkar", key="extract")
+        # Marka listesini içeren daha spesifik bir parent element arayalım
+        parent_element = brand_section.find_parent('div') # Veya 'ul'
 
-if extract_button:
-    if not url:
-        st.warning('Lütfen bir URL girin.')
-        st.session_state.designer_data = None
-        st.session_state.error_message = None
-    elif not url.startswith(('http://', 'https://')) or 'levelshoes.com' not in url:
-        st.warning('Lütfen geçerli bir Level Shoes URL\'si girin.')
-        st.session_state.designer_data = None
-        st.session_state.error_message = None
-        st.session_state.submitted_url = url # Girilen URL'yi kutuda tut
+        # Marka checkbox'larını veya label'larını bulalım
+        # input'un kardeş label'ı veya parent'ı olabilir. Yapıyı incelemek şart.
+        # Örnek 1: <label><input ...> Marka (Sayı)</label>
+        # Örnek 2: <div><input ...><span>Marka</span><span>(Sayı)</span></div>
+
+        # Örnek 1'e benzer bir yapı arayalım
+        labels = parent_element.find_all('label', class_=re.compile(r'checkbox-label|facet-label'))
+
+        if not labels:
+            # Örnek 2'ye benzer bir yapı arayalım
+            list_items = parent_element.find_all('div', class_=re.compile(r'checkbox-item|facet-item'))
+            for item in list_items:
+                checkbox = item.find('input', type='checkbox')
+                spans = item.find_all('span')
+                if checkbox and len(spans) >= 2:
+                    brand_name = spans[0].get_text(strip=True)
+                    count_text = spans[1].get_text(strip=True).strip('()')
+                    if count_text.isdigit():
+                         brands_data.append({
+                            'Marka': brand_name,
+                            'Ürün Sayısı': int(count_text)
+                         })
+
+        else: # Label tabanlı yapı
+            for label in labels:
+                 text = label.get_text(strip=True)
+                 # Marka adını ve sayısını ayıklamak için regex
+                 match = re.search(r'^(.*?)\s*\((\d+)\)$', text)
+                 if match:
+                     brand_name = match.group(1).strip()
+                     count = int(match.group(2))
+                     brands_data.append({
+                         'Marka': brand_name,
+                         'Ürün Sayısı': count
+                     })
+
+        if brands_data:
+            st.success(f"{len(brands_data)} marka verisi doğrudan HTML'den başarıyla çekildi (Alternatif Yöntem).")
+            return pd.DataFrame(brands_data)
+        else:
+            st.error("Marka verisi doğrudan HTML elementlerinden de çekilemedi.")
+            return None
+
+    except Exception as e:
+        st.error(f"Markaları doğrudan HTML'den çekerken hata oluştu (Alternatif Yöntem): {e}")
+        return None
+
+# --- Streamlit Arayüzü ---
+url = st.text_input("Sephora Ürün Listeleme Sayfası URL'sini Girin:", placeholder="https://www.sephora.ae/en/shop/makeup/C302")
+process_button = st.button("Markaları Çek ve CSV Oluştur")
+
+if process_button and url:
+    if "sephora." not in url:
+         st.warning("Lütfen geçerli bir Sephora URL'si girin.")
     else:
-        st.session_state.submitted_url = url # Başarılı gönderim için URL'yi sakla
-        with st.spinner("Veriler alınıyor ve işleniyor... Lütfen bekleyin."):
-            result = extract_designers_from_url(url)
-            if isinstance(result, list):
-                st.session_state.designer_data = result
-                st.session_state.error_message = None
-                st.success('Veri başarıyla çıkarıldı!')
-            else: # Hata veya uyarı mesajı döndü
-                st.session_state.designer_data = None
-                st.session_state.error_message = result # Hata mesajını sakla
+        with st.spinner("Sayfa indiriliyor ve markalar çekiliyor... Lütfen bekleyin."):
+            html_content = fetch_html(url)
 
-# --- Sonuçları Göster ve İndirme Butonu ---
-if st.session_state.error_message:
-    st.error(st.session_state.error_message) # Saklanan hata mesajını göster
+            if html_content:
+                df_brands = extract_brands_from_html(html_content)
 
-if st.session_state.designer_data and isinstance(st.session_state.designer_data, list):
-    st.subheader(f"Çıkarılan Tasarımcılar ({len(st.session_state.designer_data) - 1} adet)")
+                if df_brands is not None and not df_brands.empty:
+                    st.subheader("Çekilen Marka Verileri")
+                    st.dataframe(df_brands, use_container_width=True)
 
-    # Veriyi DataFrame olarak göster
-    # İlk satırı (başlık) atlayarak DataFrame oluştur
-    if len(st.session_state.designer_data) > 1:
-        df_data = {
-            st.session_state.designer_data[0][0]: [row[0] for row in st.session_state.designer_data[1:]],
-            st.session_state.designer_data[0][1]: [row[1] for row in st.session_state.designer_data[1:]]
-        }
-        st.dataframe(df_data, use_container_width=True) # Tabloyu göster
-    else:
-        st.info("Tasarımcı listesi başlık dışında veri içermiyor.")
+                    # CSV İndirme Butonu
+                    csv_buffer = StringIO()
+                    df_brands.to_csv(csv_buffer, index=False, encoding='utf-8')
+                    csv_data = csv_buffer.getvalue()
+
+                    # URL'den dosya adı oluşturma (basit)
+                    try:
+                        file_name_part = url.split('/')[-1].split('?')[0]
+                        csv_filename = f"sephora_markalar_{file_name_part}.csv"
+                    except:
+                        csv_filename = "sephora_markalar.csv"
 
 
-    # CSV İndirme Butonu
-    csv_string = convert_to_csv(st.session_state.designer_data)
-    st.download_button(
-       label="CSV Olarak İndir",
-       data=csv_string,
-       file_name='level_shoes_designers.csv',
-       mime='text/csv',
-       key='download-csv'
-    )
+                    st.download_button(
+                        label="💾 CSV Olarak İndir",
+                        data=csv_data,
+                        file_name=csv_filename,
+                        mime='text/csv',
+                    )
+                elif df_brands is not None and df_brands.empty:
+                     st.warning("Marka verisi bulunamadı. Filtreler yüklenmemiş olabilir veya sayfa yapısı farklı olabilir.")
+                # Hata mesajları zaten fonksiyon içinde verildi.
+            # else: HTML alınamadıysa hata zaten verildi.
+elif process_button and not url:
+    st.warning("Lütfen bir URL girin.")
 
 st.markdown("---")
-st.caption("Not: Bu araç Level Shoes web sitesinin yapısına bağlıdır. Site güncellenirse araç çalışmayabilir.")
+st.caption("Not: Bu uygulama Sephora web sitesinin yapısına bağlıdır. Site güncellenirse çalışmayabilir.")
