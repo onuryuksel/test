@@ -13,8 +13,8 @@ st.caption("Örnek dosya: 'Makeup Essentials_ Lips, Eyes & Skin ≡ Sephora.html
 
 def extract_brands_from_html_content(html_content):
     """
-    Parses HTML content string to find embedded brand filter data within a script tag,
-    extracts brand names and their hit counts using .get_text() and simplified regex.
+    Parses HTML content string to find embedded brand filter data within script tags,
+    extracts brand names and their hit counts. Checks ALL script tags.
 
     Args:
         html_content (str): The HTML content as a string.
@@ -23,79 +23,97 @@ def extract_brands_from_html_content(html_content):
         tuple: A tuple containing (list of brand dictionaries, list of headers)
                or (None, None) if data extraction fails.
     """
-    soup = BeautifulSoup(html_content, 'lxml') # lxml parser'ı deneyelim
-    scripts = soup.find_all('script')
+    try:
+        soup = BeautifulSoup(html_content, 'lxml')
+        scripts = soup.find_all('script')
+    except Exception as e:
+        st.error(f"HTML ayrıştırılırken hata oluştu (lxml): {e}")
+        st.info("Standart 'html.parser' ile tekrar deneniyor...")
+        try:
+            soup = BeautifulSoup(html_content, 'html.parser')
+            scripts = soup.find_all('script')
+        except Exception as e2:
+            st.error(f"HTML ayrıştırılırken tekrar hata oluştu (html.parser): {e2}")
+            return None, None
 
     brands_data = []
-    found_data = False
+    found_potential_match = False # Eşleşme olup olmadığını takip etmek için
     fieldnames = ['Marka', 'Urun Adedi'] # CSV başlıkları
 
-    # Basitleştirilmiş Regex: "attributeId":"c_brand" ifadesini ve onu takip eden
-    # en yakın "values": [...] yapısını arar. İç içe yapıyı (?R) ile değil,
-    # açgözlü olmayan .*? ile eşleştirir.
     pattern = re.compile(r'"attributeId"\s*:\s*"c_brand".*?"values"\s*:\s*(\[.*?\])', re.DOTALL)
 
-    st.write(f"Toplam {len(scripts)} script etiketi bulundu.") # Bilgi
+    st.write(f"Toplam {len(scripts)} script etiketi bulundu ve kontrol ediliyor...")
 
     for i, script in enumerate(scripts):
         script_content = script.get_text()
         if script_content:
             match = pattern.search(script_content)
             if match:
+                found_potential_match = True # En az bir script'te desen bulundu
                 st.info(f"Script #{i+1} içinde potansiyel 'c_brand' verisi bulundu.")
                 json_like_string = match.group(1)
-                # st.text(f"Yakalanan JSON string'i (ilk 150 karakter): {json_like_string[:150]}...")
 
-                # JSON string'ini temizlemeye çalışalım (sondaki virgül vb.)
+                # JSON string'ini temizlemeye çalışalım
                 json_like_string = json_like_string.strip()
-                # Nadiren de olsa sonda virgül kalabilir
                 if json_like_string.endswith(','):
                    json_like_string = json_like_string[:-1]
-                   st.warning("JSON string'inin sonundaki fazladan virgül temizlendi.")
 
                 try:
-                    # JSON olarak ayrıştırmayı dene
                     data_list = json.loads(json_like_string)
 
-                    if isinstance(data_list, list):
-                        st.success(f"JSON başarıyla liste olarak ayrıştırıldı. {len(data_list)} potansiyel öğe bulundu.")
-                        processed_count = 0
+                    if isinstance(data_list, list) and data_list:
+                        processed_count_in_script = 0
                         for item in data_list:
-                            if isinstance(item, dict) and 'label' in item and 'hitCount' in item:
+                            # Veri yapısını daha dikkatli kontrol edelim
+                            if (isinstance(item, dict) and
+                                    'label' in item and isinstance(item['label'], str) and
+                                    'hitCount' in item and isinstance(item['hitCount'], int)):
                                 brands_data.append({
                                     fieldnames[0]: item['label'],
                                     fieldnames[1]: item['hitCount']
                                 })
-                                processed_count += 1
-                            # else:
-                            #     st.warning(f"Listede beklenen formatta olmayan öğe: {item}") # Çok fazla uyarı verebilir
+                                processed_count_in_script += 1
 
-                        if processed_count > 0:
-                           st.success(f"{processed_count} adet marka/ürün sayısı başarıyla eklendi.")
-                           found_data = True
-                           break # Veri bulundu, döngüden çık
-                        else:
-                            st.warning("JSON listesi ayrıştırıldı ancak içinde geçerli marka öğesi bulunamadı.")
-                    else:
-                         st.warning(f"Regex eşleşti ancak ayrıştırılan veri bir liste değil: {type(data_list)}")
+                        if processed_count_in_script > 0:
+                           st.success(f"Script #{i+1}: {processed_count_in_script} adet geçerli marka/ürün sayısı bulundu ve eklendi.")
+                           # Artık tüm geçerli verileri topladığımız için burada durabiliriz,
+                           # çünkü genellikle bu veri tek bir yerde bulunur.
+                           # Ancak garanti olması için break koymayalım, belki başka yerde de vardır.
+                           # found_data = True # Eğer sadece ilk bulduğu yerde dursun istiyorsak bunu açıp break ekleyebiliriz
+                           # break
+                        # else:
+                           # st.warning(f"Script #{i+1}: JSON listesi ayrıştırıldı ancak içinde geçerli marka öğesi bulunamadı.")
+                    # else:
+                         # st.warning(f"Script #{i+1}: Regex eşleşti ancak ayrıştırılan veri beklenen liste formatında değil veya boş.")
 
                 except json.JSONDecodeError as e:
                     st.warning(f"Script #{i+1} içinde JSON ayrıştırma hatası: {e}. Veri başlangıcı: {json_like_string[:100]}...")
                 except Exception as e:
                     st.error(f"Script #{i+1} işlenirken beklenmedik bir hata: {e}")
 
-    if not found_data or not brands_data:
-        st.error("HTML içinde 'c_brand' attributeId'sine sahip geçerli marka filtresi verisi bulunamadı. Lütfen HTML dosyasının doğru sayfanın tam kaynağı olduğundan ve verinin bir script etiketi içinde olduğundan emin olun.")
+    if not brands_data: # Eğer döngü bittiğinde hiç veri eklenmemişse
+        if found_potential_match:
+            st.error("Desenle eşleşen script(ler) bulundu ancak içlerinden geçerli marka verisi (label/hitCount içeren liste) çıkarılamadı. Script içeriği beklenenden farklı olabilir.")
+        else:
+            st.error("HTML içinde 'c_brand' attributeId'sine sahip marka filtresi deseni içeren hiçbir script etiketi bulunamadı.")
         return None, None
 
-    return brands_data, fieldnames
+    # Yinelenenleri (eğer varsa) kaldır
+    unique_brands_data = []
+    seen_brands = set()
+    for brand_entry in brands_data:
+        if brand_entry['Marka'] not in seen_brands:
+            unique_brands_data.append(brand_entry)
+            seen_brands.add(brand_entry['Marka'])
+
+    st.info(f"Toplam {len(unique_brands_data)} benzersiz marka bulundu.")
+    return unique_brands_data, fieldnames
 
 # --- Streamlit File Uploader ---
 uploaded_file = st.file_uploader("HTML Dosyasını Buraya Sürükleyin veya Seçin", type=["html", "htm"])
 
 if uploaded_file is not None:
     try:
-        # Dosyayı oku
         stringio = io.StringIO(uploaded_file.getvalue().decode("utf-8"))
         html_content = stringio.read()
         st.success(f"'{uploaded_file.name}' başarıyla yüklendi ve okundu.")
@@ -114,11 +132,10 @@ if uploaded_file is not None:
                file_name='sephora_markalar.csv',
                mime='text/csv',
             )
-        # else: # Hata mesajı zaten extract_brands_from_html_content içinde veriliyor
-            # pass
+        # Hata mesajları artık fonksiyon içinde veriliyor.
 
     except UnicodeDecodeError:
         st.error("Dosya kodlaması UTF-8 değil gibi görünüyor. Lütfen UTF-8 formatında kaydedilmiş bir HTML dosyası yükleyin.")
     except Exception as e:
-        st.error(f"Dosya işlenirken bir hata oluştu: {e}")
-        st.exception(e) # Daha detaylı hata izi için
+        st.error(f"Dosya işlenirken genel bir hata oluştu: {e}")
+        st.exception(e)
