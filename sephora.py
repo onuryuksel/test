@@ -3,12 +3,16 @@ import pandas as pd
 from bs4 import BeautifulSoup
 import re
 import io
-import json # JSON parse etmeyi denemek için
+import json # Güvenlik için ve potansiyel JSON parse denemeleri için
+
+# Session state'i kullanarak uyarıların tekrar tekrar gösterilmesini engelle
+if 'warning_shown' not in st.session_state:
+    st.session_state.warning_shown = False
 
 def extract_brand_filters_revised(html_content):
     """
     Parses the uploaded HTML content to extract brand filters and their counts,
-    specifically targeting the structure found in the provided Sephora HTML.
+    specifically targeting the multi-step reference structure found in the provided Sephora HTML.
 
     Args:
         html_content (str): The HTML content as a string.
@@ -17,145 +21,98 @@ def extract_brand_filters_revised(html_content):
         list: A list of dictionaries, where each dictionary contains 'Brand' and 'Count'.
               Returns an empty list if no data is found or an error occurs.
     """
+    st.session_state.warning_shown = False # Her yeni çalıştırmada uyarı durumunu sıfırla
     brands_data = []
+    all_script_content = ""
+
     try:
         soup = BeautifulSoup(html_content, 'html.parser')
         scripts = soup.find_all('script')
 
-        filter_data_str = None
-        # Script etiketlerinde filtre tanımlarını içeren kısmı ara
+        # Performansı artırmak için tüm script içeriklerini birleştir
         for script in scripts:
-            # 'attributeId":"c_brand"' ve 'filters":[' anahtar kelimelerini içeren script'i bulmaya çalış
-            if script.string and '"attributeId":"c_brand"' in script.string and '"filters":[' in script.string:
-                 # 'filters' array'inin içeriğini doğrudan çıkarmayı dene
-                 # filters array'inin başlangıcından kapanış köşeli parantezine kadar ara
-                 match = re.search(r'"filters":\s*(\[.*?\])', script.string, re.DOTALL | re.IGNORECASE) # Boşlukları ve büyük/küçük harfi göz ardı et
-                 if match:
-                     filter_data_str = match.group(1)
-                     # st.write("DEBUG: Found filters array string:") # Hata ayıklama için
-                     # st.code(filter_data_str[:500] + "...", language='json') # İlk 500 karakteri göster
-                     break # Bulunduysa döngüden çık
+            if script.string:
+                all_script_content += script.string + "\n"
 
-        if not filter_data_str:
-            # Geriye dönük uyumluluk: self.__next_f içindeki veriyi ara (ilk deneme başarısız olursa)
-            st.info("Initial filter search failed, trying fallback method...")
-            for script in scripts:
-                if script.string and 'self.__next_f.push([1,"' in script.string:
-                    payload_match = re.search(r'self\.__next_f\.push\(\[1,"(.*)"\]\)', script.string, re.DOTALL)
-                    if payload_match:
-                        payload_str_escaped = payload_match.group(1)
-                        # Temel kaçış karakteri temizleme (tüm durumları kapsamayabilir)
-                        # JSON ayrıştırmasının hatasız çalışması için kaçış karakterlerini doğru şekilde ele almak önemlidir
-                        try:
-                           # JSON'un beklemediği bazı yapıları (örn. $L13) değiştirmeyi dene
-                           # Bu kısım çok hassas olabilir ve sitenin yapısı değiştikçe güncellenmesi gerekebilir
-                           payload_str_cleaned = payload_str_escaped.replace('\\\\"', "'").replace('\\"', '"').replace('\\\\', '\\').replace('\\n', '')
-                           # $ ile başlayan referansları geçici olarak string yap
-                           payload_str_cleaned = re.sub(r'":(\$[a-zA-Z0-9]+)([,}])', r'":"\1"\2', payload_str_cleaned)
-                           payload_str_cleaned = re.sub(r'\[(\$[a-zA-Z0-9]+)\]', r'["\1"]', payload_str_cleaned) # $ ile başlayan array elemanları için
+        # 1. Adım: Tüm potansiyel marka tanımlarını (örn: "63":{...}) bul ve sakla
+        individual_brand_defs = {}
+        # Daha spesifik olarak "hitCount" ve "label" içeren objeleri ara
+        # Regex: "SAYI": { "hitCount": SAYI, "label": "MARKAISMI" ... }
+        brand_def_pattern = re.compile(r'"(\d+)"\s*:\s*\{\s*"hitCount"\s*:\s*(\d+)\s*,\s*"label"\s*:\s*"((?:[^"\\]|\\.)*)"') # Label içinde kaçış karakterlerini de yakala
+        all_defs = brand_def_pattern.findall(all_script_content)
+        for key, count, label in all_defs:
+            # Label'daki olası kaçış karakterlerini temizle (örn: \")
+            cleaned_label = label.replace('\\"', '"').strip()
+            individual_brand_defs[key] = {'Brand': cleaned_label, 'Count': int(count)}
 
-                           # Hata ayıklama için temizlenmiş stringin bir kısmını göster
-                           # st.code(payload_str_cleaned[:1000]+"...", language='json')
+        if not individual_brand_defs:
+             st.warning("Could not find any individual brand definitions (e.g., '63':{'hitCount':...}). The HTML structure might have changed.")
+             st.session_state.warning_shown = True
+             return []
+        # else:
+        #      st.write(f"DEBUG: Found {len(individual_brand_defs)} potential brand definitions.") # Hata ayıklama
 
-                           filter_match = re.search(r'"filters":\s*(\[.*?\])', payload_str_cleaned, re.DOTALL | re.IGNORECASE)
-                           if filter_match:
-                               filter_data_str = filter_match.group(1)
-                               # st.write("DEBUG: Found filters array string (Fallback):") # Hata ayıklama için
-                               # st.code(filter_data_str[:500] + "...", language='json') # İlk 500 karakteri göster
-                               break
-                        except Exception as parse_err:
-                           st.warning(f"Error cleaning/parsing fallback data: {parse_err}")
-                           continue # Sonraki script'e geç
-            
-            if not filter_data_str:
-                 st.warning("Could not locate the 'filters' array within any script tag using primary or fallback methods.")
-                 return []
-
-
-        # Çıkarılan filtreler string'i içinde spesifik marka filtresini bul
-        # Daha esnek boşluk karakterleri için \s* kullanıldı
-        # Değerler bölümünün doğrudan array [] olmasını bekleyen desen
-        brand_filter_match = re.search(
-            r'\{\s*"attributeId"\s*:\s*"c_brand"\s*,\s*"label"\s*:\s*"Brands"\s*,\s*"values"\s*:\s*(\[.*?\])\s*\}',
-            filter_data_str,
-            re.DOTALL | re.IGNORECASE
-        )
-
-        if not brand_filter_match:
-            # Eğer doğrudan array bulunamazsa, $ ile başlayan referans formatını ara
-            brand_filter_match_ref = re.search(
-                 r'\{\s*"attributeId"\s*:\s*"c_brand"\s*,\s*"label"\s*:\s*"Brands"\s*,\s*"values"\s*:\s*"(\$\d+)"\s*\}',
-                 filter_data_str,
-                 re.DOTALL | re.IGNORECASE
-            )
-            if brand_filter_match_ref:
-                ref_key = brand_filter_match_ref.group(1).replace("$","") # '$62' -> '62'
-                st.info(f"Found brand filter reference key: ${ref_key}. Searching for its definition...")
-                 # Şimdi referans anahtarının tanımını (örn. '62:[...]') tüm scriptlerde ara
-                ref_definition_pattern = re.compile(rf'"{ref_key}":\s*(\[.*?\])', re.DOTALL) # Anahtarın tırnak içinde olduğunu varsay
-                found_ref_def = False
-                for script in scripts:
-                    if script.string:
-                         ref_def_match = ref_definition_pattern.search(script.string)
-                         if ref_def_match:
-                             brands_array_str_ref = ref_def_match.group(1)
-                             # $ ile başlayan marka referanslarını ayıkla (örneğin "$63")
-                             brand_key_matches = re.findall(r'"\$(\d+)"', brands_array_str_ref)
-                             if not brand_key_matches:
-                                  st.warning(f"Found reference definition for ${ref_key}, but could not extract individual brand keys (like '$63').")
-                                  return []
-
-                             # Şimdi her bir anahtarın ('63', '64', ...) tam tanımını ara
-                             individual_brand_defs = {}
-                             brand_def_pattern = re.compile(r'"(\d+)":\s*(\{\s*"hitCount"\s*:\s*(\d+)\s*,\s*"label"\s*:\s*"([^"]+)"\s*,\s*"value"\s*:\s*"[^"]+"\s*\})')
-                             for script_inner in scripts:
-                                 if script_inner.string:
-                                     defs = brand_def_pattern.findall(script_inner.string)
-                                     for key, full_def, count, label in defs:
-                                         individual_brand_defs[key] = {'Brand': label.replace('\\"', '"').strip(), 'Count': int(count)}
-                             
-                             # Eşleşen anahtarları kullanarak veriyi oluştur
-                             for key in brand_key_matches:
-                                 if key in individual_brand_defs:
-                                      brands_data.append(individual_brand_defs[key])
-                                 else:
-                                      st.warning(f"Definition for referenced brand key '{key}' not found.")
-                             
-                             found_ref_def = True
-                             break # Referans tanımını bulduk, döngüden çık
-                if not found_ref_def:
-                    st.warning(f"Found brand filter reference key ${ref_key}, but couldn't find its definition array '[...]'.")
-                    return []
-            else:
-                st.warning("Found 'filters' array, but couldn't find the specific 'c_brand' attribute structure (neither direct values nor reference value).")
-                # Hata ayıklama için bulunan filtre verisini göster
-                st.write("DEBUG: Searched within this filter data string:")
-                st.code(filter_data_str[:1000] + "..."  if filter_data_str else "None", language='json')
-                return []
+        # 2. Adım: "Brands" filtresinin referans anahtarını ("$62" gibi) bul
+        brand_filter_ref_key = None
+        brand_filter_ref_pattern = re.compile(r'"attributeId"\s*:\s*"c_brand"\s*,\s*"label"\s*:\s*"Brands"\s*,\s*"values"\s*:\s*"\$(\d+)"')
+        ref_match = brand_filter_ref_pattern.search(all_script_content)
+        if ref_match:
+            brand_filter_ref_key = ref_match.group(1) # Sadece sayısal kısmı ('62') al
+            # st.write(f"DEBUG: Found brand filter reference key: ${brand_filter_ref_key}") # Hata ayıklama
         else:
-             # Doğrudan values array'i bulunduysa, onu parse et
-             brands_array_str = brand_filter_match.group(1)
-             brand_entry_pattern = re.compile(r'\{\s*"hitCount"\s*:\s*(\d+)\s*,\s*"label"\s*:\s*"([^"]+)"\s*,\s*"value"\s*:\s*"[^"]+"\s*\}')
-             brand_matches = brand_entry_pattern.findall(brands_array_str)
-             if not brand_matches:
-                 st.warning("Found the 'Brands' filter structure with direct values, but failed to parse individual brand entries.")
-                 return []
-             for count, label in brand_matches:
-                 cleaned_label = label.replace('\\"', '"').strip() # Handle potential escaped quotes
-                 brands_data.append({'Brand': cleaned_label, 'Count': int(count)})
+            st.warning("Could not find the 'Brands' filter definition structure with a reference value (e.g., 'values':'$62').")
+            st.session_state.warning_shown = True
+            return []
+
+        # 3. Adım: Referans anahtarının tanımladığı array'i ("62":[...]) bul
+        brands_array_str = None
+        # Anahtarın tırnak içinde olduğunu varsayarak deseni oluştur
+        ref_definition_pattern = re.compile(rf'"{brand_filter_ref_key}"\s*:\s*(\[.*?\])', re.DOTALL)
+        def_match = ref_definition_pattern.search(all_script_content)
+        if def_match:
+            brands_array_str = def_match.group(1)
+            # st.write(f"DEBUG: Found definition array for key {brand_filter_ref_key}:") # Hata ayıklama
+            # st.code(brands_array_str[:200] + "...", language='text') # Hata ayıklama
+        else:
+            st.warning(f"Found brand filter reference key ${brand_filter_ref_key}, but couldn't find its corresponding definition array '[...]' in the scripts.")
+            st.session_state.warning_shown = True
+            return []
+
+        # 4. Adım: Array içindeki asıl marka anahtarlarını ("$63", "$64" -> "63", "64") çıkar
+        brand_keys_in_array = re.findall(r'"\$(\d+)"', brands_array_str)
+        if not brand_keys_in_array:
+            st.warning(f"Found the definition array for key {brand_filter_ref_key}, but failed to extract individual brand reference keys (e.g., '$63') from it.")
+            st.code(brands_array_str, language='text') # Hata ayıklama için array'i göster
+            st.session_state.warning_shown = True
+            return []
+        # else:
+        #      st.write(f"DEBUG: Extracted {len(brand_keys_in_array)} brand keys from reference array.") # Hata ayıklama
+
+
+        # 5. Adım: Çıkarılan anahtarları kullanarak ilk adımda bulunan tanımlardan veriyi oluştur
+        for key in brand_keys_in_array:
+            if key in individual_brand_defs:
+                brands_data.append(individual_brand_defs[key])
+            else:
+                # Bu nadir olmalı, eğer ilk adım tüm tanımları bulduysa
+                st.warning(f"Definition for referenced brand key '{key}' was expected but not found in the initial scan.")
+                st.session_state.warning_shown = True
 
 
         if not brands_data:
-             st.warning("Data extraction process completed, but no brand data was ultimately collected.")
+             # Bu noktada anahtarlar bulunduysa ama tanımlar eşleşmediyse bu uyarı gösterilir.
+             st.warning("Successfully parsed filter structure but couldn't match extracted brand keys to their definitions.")
+             st.session_state.warning_shown = True
              return []
 
         # Alfabetik olarak sırala
         brands_data.sort(key=lambda x: x['Brand'])
 
     except Exception as e:
-        st.error(f"An error occurred during HTML parsing: {e}")
+        st.error(f"An unexpected error occurred during HTML processing: {e}")
         import traceback
         st.error(traceback.format_exc()) # Daha detaylı hata çıktısı için
+        st.session_state.warning_shown = True
         return []
 
     return brands_data
@@ -174,7 +131,6 @@ uploaded_file = st.file_uploader("Choose a Sephora PLP HTML file", type="html")
 
 if uploaded_file is not None:
     # Dosyayı string olarak oku:
-    # Önce UTF-8 deneyelim, olmazsa başka encoding'leri deneyebiliriz
     try:
         string_data = uploaded_file.getvalue().decode("utf-8")
     except UnicodeDecodeError:
@@ -197,11 +153,17 @@ if uploaded_file is not None:
         # Pandas DataFrame oluştur
         df = pd.DataFrame(extracted_data)
 
+        # Sütun adlarını doğrula (Brand, Count olmalı)
+        if list(df.columns) != ['Brand', 'Count']:
+             st.warning(f"Warning: DataFrame columns are not as expected: {list(df.columns)}. Adjusting...")
+             # Gerekirse yeniden adlandırma yapılabilir, ama extract fonksiyonu doğruysa buna gerek kalmamalı.
+             # df.columns = ['Brand', 'Count']
+
         st.dataframe(df, use_container_width=True)
 
         # DataFrame'i CSV string'ine dönüştür
         csv_buffer = io.StringIO()
-        df.to_csv(csv_buffer, index=False, encoding='utf-8-sig') # utf-8-sig Excel uyumluluğu için daha iyi olabilir
+        df.to_csv(csv_buffer, index=False, encoding='utf-8-sig') # Excel uyumluluğu için
         csv_string = csv_buffer.getvalue()
 
         # İndirme düğmesini göster
@@ -212,9 +174,9 @@ if uploaded_file is not None:
            mime='text/csv',
         )
     # Eğer extract_brand_filters_revised içinde zaten bir uyarı gösterildiyse tekrar gösterme
-    elif 'streamlit_warning_shown' not in st.session_state:
-         st.warning("No brand filter data found after processing. Ensure the HTML file is a complete Sephora PLP and contains the filter section data, possibly within `<script>` tags.")
+    elif not st.session_state.warning_shown:
+         st.warning("No brand filter data was ultimately extracted. Please ensure the uploaded file is a complete HTML source from a Sephora PLP page containing the brand filter information.")
 
-# Reset warning state if file is removed or new one is uploaded
-if 'warning_shown' in st.session_state and uploaded_file is None:
-    del st.session_state['warning_shown']
+# Reset warning state if file is removed
+if uploaded_file is None and st.session_state.warning_shown:
+    st.session_state.warning_shown = False
