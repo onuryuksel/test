@@ -6,22 +6,18 @@ import json
 from io import StringIO
 import os
 
-# Sayfa Başlığı
+# ... (Sayfa Başlığı, Talimatlar vb. aynı kalabilir) ...
 st.set_page_config(page_title="Sephora Marka Filtre Çekici", layout="wide")
-st.title("💄 Sephora Marka Filtre Veri Çekici (HTML Yükleme)2")
+st.title("💄 Sephora Marka Filtre Veri Çekici (HTML Yükleme)")
 st.caption("Kaydettiğiniz Sephora ürün listeleme sayfası HTML dosyasını yükleyerek marka filtresindeki verileri CSV olarak indirin.")
-
-# --- Kullanıcı Talimatları ---
 st.info("""
 **Nasıl Kullanılır:**
-1.  Marka filtrelerini çekmek istediğiniz Sephora ürün listeleme sayfasını **web tarayıcınızda** açın.
+1.  Marka filtrelerini çekmek istediğiniz Sephora ürün listeleme sayfasını (örn: Makyaj, Parfüm kategorisi) **web tarayıcınızda** açın.
 2.  Sayfanın **tamamen** yüklendiğinden emin olun (sol taraftaki **"Refine"** veya benzeri bölümdeki **"Brands"** filtresinin ve markaların görünür olduğundan emin olun).
 3.  Tarayıcıda sayfaya sağ tıklayın ve **"Farklı Kaydet" (Save Page As...)** seçeneğini seçin.
-4.  Kayıt türü olarak **"Web Sayfası, Sadece HTML" (Webpage, HTML Only)** seçeneğini seçin. Dosya uzantısı `.html` veya `.htm` olmalıdır. (Eğer bu çalışmazsa "Web Sayfası, Tamamı" deneyebilirsiniz ama ilk tercih "Sadece HTML" olmalı).
+4.  Kayıt türü olarak **"Web Sayfası, Sadece HTML" (Webpage, HTML Only)** seçeneğini seçin. Dosya uzantısı `.html` veya `.htm` olmalıdır.
 5.  Kaydettiğiniz bu `.html` dosyasını aşağıdaki "Gözat" düğmesini kullanarak yükleyin.
 """)
-
-# --- Fonksiyonlar ---
 
 def find_nested_data(data, target_key, target_value):
     """İç içe geçmiş dict/list'lerde belirli bir anahtar-değer çiftini arar."""
@@ -37,39 +33,34 @@ def find_nested_data(data, target_key, target_value):
             if found: return found
     return None
 
-def extract_brands_from_next_data(soup):
-    """__NEXT_DATA__ script'inden marka verilerini çıkarır."""
+def extract_brands_from_potential_next_data(soup):
+    """ID'siz olarak __NEXT_DATA__ benzeri script'leri bulup işlemeyi dener."""
+    st.info("__NEXT_DATA__ ID'li script bulunamadı, potansiyel veri scriptleri aranıyor...")
+    scripts = soup.find_all('script')
+    st.info(f"Toplam {len(scripts)} script etiketi bulundu.")
+    potential_data_script = None
+
+    for script in scripts:
+        # İçeriği al ve kontrol et (boş etiketleri atla)
+        script_content = script.string
+        if script_content:
+            script_content = script_content.strip()
+            # İçeriğin JSON'a benzeyip benzemediğini kontrol et (basit kontrol)
+            if script_content.startswith('{') and script_content.endswith('}') and 'props' in script_content[:500] and 'pageProps' in script_content[:1000]:
+                 st.info("JSON'a benzeyen ve 'props', 'pageProps' içeren bir script bulundu.")
+                 potential_data_script = script_content
+                 break # İlk uygun olanı al
+
+    if not potential_data_script:
+        st.warning("JSON içeren potansiyel __NEXT_DATA__ script'i bulunamadı.")
+        return None
+
+    # JSON ayrıştırma ve veri çıkarma (öncekiyle aynı mantık)
     brands_data = []
     processed_brands = set()
-    script_tag = soup.find('script', id='__NEXT_DATA__')
-
-    if not script_tag:
-        st.warning("__NEXT_DATA__ script etiketi HTML içinde bulunamadı.")
-        return None
-
-    st.info("__NEXT_DATA__ script etiketi bulundu.")
-    script_content = script_tag.string # .string içeriği alır
-
-    # Debug: Script içeriğini kontrol et
-    if script_content:
-        script_content = script_content.strip() # Baştaki/sondaki boşlukları temizle
-        st.info(f"__NEXT_DATA__ içeriğinin başı (ilk 500 karakter):\n```json\n{script_content[:500]}...\n```")
-        if not script_content: # strip() sonrası boş kalmışsa
-             st.error("__NEXT_DATA__ etiketi bulundu ancak içeriği boş veya sadece boşluklardan oluşuyor.")
-             return None
-    else:
-        st.error("__NEXT_DATA__ etiketi bulundu ancak .string ile içerik alınamadı (None döndü). Etiket yapısı beklenenden farklı olabilir.")
-        # Alternatif olarak get_text() deneyebiliriz ama genellikle .string yeterli olmalı
-        # script_content_alt = script_tag.get_text(strip=True)
-        # if script_content_alt: ...
-        return None
-
-    # JSON ayrıştırmayı dene
     try:
-        next_data = json.loads(script_content)
-        st.success("__NEXT_DATA__ içeriği JSON olarak başarıyla ayrıştırıldı.")
-
-        # 'attributeId': 'c_brand' içeren yapıyı bul
+        next_data = json.loads(potential_data_script)
+        st.success("Potansiyel veri scripti JSON olarak başarıyla ayrıştırıldı.")
         brand_filter_dict = find_nested_data(next_data, 'attributeId', 'c_brand')
 
         if brand_filter_dict:
@@ -77,118 +68,67 @@ def extract_brands_from_next_data(soup):
             if 'values' in brand_filter_dict and isinstance(brand_filter_dict['values'], list):
                 st.info(f"Marka 'values' listesinde {len(brand_filter_dict['values'])} öğe bulundu.")
                 for item in brand_filter_dict['values']:
-                    if isinstance(item, dict) and 'label' in item and 'hitCount' in item:
-                        brand_name = item['label'].strip()
-                        hit_count = item['hitCount']
-                        if brand_name and isinstance(hit_count, int) and brand_name.lower() != 'no' and brand_name not in processed_brands:
-                            brands_data.append({'Marka': brand_name, 'Ürün Sayısı': hit_count})
-                            processed_brands.add(brand_name)
+                     if isinstance(item, dict) and 'label' in item and 'hitCount' in item:
+                         brand_name = item['label'].strip()
+                         hit_count = item['hitCount']
+                         if brand_name and isinstance(hit_count, int) and brand_name.lower() != 'no' and brand_name not in processed_brands:
+                             brands_data.append({'Marka': brand_name, 'Ürün Sayısı': hit_count})
+                             processed_brands.add(brand_name)
                 if brands_data:
-                    st.info(f"{len(brands_data)} geçerli marka/sayı çifti __NEXT_DATA__ içinden ayıklandı.")
+                    st.info(f"{len(brands_data)} geçerli marka/sayı çifti potansiyel __NEXT_DATA__ içinden ayıklandı.")
                     return pd.DataFrame(brands_data)
                 else:
-                    st.warning("__NEXT_DATA__ içinde marka filtresi ('c_brand') bulundu ancak geçerli marka/sayı çifti içermiyordu.")
-                    return pd.DataFrame() # Boş DataFrame
+                    st.warning("Marka filtresi ('c_brand') bulundu ancak geçerli öğe yoktu.")
+                    return pd.DataFrame()
             else:
-                st.warning("'c_brand' yapısı bulundu ancak geçerli bir 'values' listesi içermiyor.")
+                st.warning("'c_brand' yapısı bulundu ancak 'values' listesi yok.")
                 return None
         else:
-            st.warning("__NEXT_DATA__ içinde 'c_brand' attributeId'li filtre yapısı bulunamadı.")
+            st.warning("Potansiyel veri scripti içinde 'c_brand' yapısı bulunamadı.")
             return None
-
-    except json.JSONDecodeError as e:
-        st.error(f"__NEXT_DATA__ içeriği JSON olarak ayrıştırılamadı: {e}")
-        st.error("Hatanın oluştuğu yerdeki içerik (ilk 100 karakter): " + repr(script_content[:100]))
-        st.warning("HTML dosyasının tarayıcıdan 'Web Sayfası, Sadece HTML' olarak doğru şekilde kaydedildiğinden emin olun.")
-        return None
     except Exception as e:
-        st.error(f"__NEXT_DATA__ işlenirken beklenmedik bir hata oluştu: {e}")
+        st.error(f"Potansiyel __NEXT_DATA__ işlenirken hata: {e}")
         return None
 
-def extract_brands_directly(soup):
-    """Alternatif yöntem: Doğrudan HTML elementlerini parse etmeye çalışır."""
-    st.info("Alternatif yöntem (doğrudan HTML elementleri) deneniyor...")
+def extract_brands_directly_very_generic(soup):
+    """ÇOK GENEL Alternatif yöntem: Sayfadaki tüm label'ları tarar."""
+    st.info("En genel alternatif yöntem deneniyor (tüm label'lar taranıyor)...")
     brands_data = []
     processed_brands = set()
 
-    # 1. Adım: "Brands" başlığını veya benzerini içeren bölümü bulmaya çalış
-    brand_section = None
-    # CSS seçicileri deneyelim (daha spesifik olabilir)
-    css_selectors = [
-        'div[data-testid="facet-container-Brands"]', # Olası bir test ID'si
-        'div[data-testid="Brands"]',
-        'div[aria-labelledby*="brand"]', # 'brand' içeren aria-labelledby
-        'section[aria-labelledby*="brand"]',
-        'aside[aria-labelledby*="brand"]'
-    ]
-    for selector in css_selectors:
-        found_section = soup.select_one(selector)
-        if found_section:
-            brand_section = found_section
-            st.info(f"Potansiyel filtre bölümü CSS seçici ile bulundu: '{selector}'")
-            break
+    # Sayfadaki TÜM label elementlerini bul
+    all_labels = soup.find_all('label')
+    st.info(f"Toplam {len(all_labels)} label etiketi bulundu.")
 
-    # CSS seçicileri başarısız olursa, metin içeriği ile ara
-    if not brand_section:
-        st.warning("CSS seçicileri ile filtre bölümü bulunamadı, metin araması yapılıyor...")
-        possible_headers = soup.find_all(['h3', 'h2', 'button', 'div'], string=re.compile(r'^\s*Brands?\s*$', re.IGNORECASE))
-        for header in possible_headers:
-            # Bulunan başlığın etrafındaki parent elementleri kontrol et
-            current = header
-            for _ in range(5): # En fazla 5 seviye yukarı bak
-                parent = current.find_parent(['div', 'section', 'aside'])
-                # Parent içinde checkbox veya list item gibi filtre öğeleri var mı?
-                if parent and (parent.find('input', type='checkbox') or len(parent.find_all('li')) > 2):
-                    brand_section = parent
-                    st.info(f"'Brands' başlığından yola çıkarak parent bulundu: <{brand_section.name} class='{brand_section.get('class', 'N/A')}' id='{brand_section.get('id', 'N/A')}'>")
-                    break
-                if not parent: break
-                current = parent
-            if brand_section: break
-
-    if not brand_section:
-        st.error("Marka filtresi bölümü HTML içinde otomatik olarak tespit edilemedi (Alternatif Yöntem).")
+    if not all_labels:
+        st.error("HTML içinde hiç label etiketi bulunamadı.")
         return None
 
-    # 2. Adım: Filtre bölümü içinde marka öğelerini bul
-    # Checkbox'ları içeren label'ları veya div'leri hedefle
-    items = brand_section.find_all('label', class_=re.compile(r'checkbox|facet', re.IGNORECASE))
-    if not items:
-        # Input'ların parent'larını dene
-        inputs = brand_section.find_all('input', type='checkbox')
-        items = [inp.find_parent(['label','div','li']) for inp in inputs if inp.find_parent(['label','div','li'])]
-    if not items:
-         # Sadece list item'larını dene (daha genel)
-        items = brand_section.find_all('li')
-    if not items:
-        # En genel: içinde (sayı) olan div'leri ara
-        items = brand_section.find_all('div', text=re.compile(r'\(\d+\)\s*$'))
-
-
-    if not items:
-        st.error("Marka listesi elementleri bulunamadı.")
-        return None
-
-    st.info(f"Bulunan olası marka elementi sayısı: {len(items)}")
-
-    for item in items:
-        text_content = item.get_text(separator=' ', strip=True)
+    found_count = 0
+    for label in all_labels:
+        # Label'ın içinde checkbox var mı diye kontrol et (daha olası)
+        checkbox = label.find('input', type='checkbox')
+        # Checkbox yoksa bile metni kontrol et
+        text_content = label.get_text(separator=' ', strip=True)
         # Regex: Marka Adı (Sayı) formatını ara
-        # Başında/sonunda ekstra karakterler olabileceğini varsayalım
-        match = re.search(r'([a-zA-Z0-9 &\'\+\.-]+)\s*\((\d+)\)', text_content)
+        match = re.search(r'([a-zA-Z0-9 &\'\+\.-]+)\s*\((\d+)\)$', text_content)
         if match:
             brand_name = match.group(1).strip()
             count = int(match.group(2))
-            if brand_name and brand_name.lower() not in ['no', 'yes'] and brand_name not in processed_brands:
-                brands_data.append({'Marka': brand_name, 'Ürün Sayısı': count})
-                processed_brands.add(brand_name)
+            # Eğer checkbox varsa veya marka adı makul görünüyorsa ekle
+            if checkbox or len(brand_name) > 1 : # Sadece checkbox olanları veya 1 karakterden uzun markaları al
+                 if brand_name and brand_name.lower() not in ['no', 'yes'] and brand_name not in processed_brands:
+                     brands_data.append({'Marka': brand_name, 'Ürün Sayısı': count})
+                     processed_brands.add(brand_name)
+                     found_count += 1
 
     if brands_data:
-        st.success(f"{len(brands_data)} marka verisi doğrudan HTML'den başarıyla çekildi.")
+        st.success(f"{len(brands_data)} olası marka verisi HTML'deki label'lardan ayıklandı.")
         return pd.DataFrame(brands_data)
     else:
-        st.warning("Doğrudan HTML taramasında yapısal marka verisi bulunamadı veya ayıklanamadı.")
+        st.warning("Genel HTML taramasında (label'lar) yapısal marka verisi bulunamadı.")
         return None
+
 
 # --- Streamlit Arayüzü ---
 uploaded_file = st.file_uploader(
@@ -204,37 +144,33 @@ if uploaded_file is not None:
         html_content = None
         try:
             html_content_bytes = uploaded_file.getvalue()
-            # UTF-8 decode etmeyi dene, olmazsa latin-1 gibi başka bir encoding dene
             try:
                 html_content = html_content_bytes.decode("utf-8")
             except UnicodeDecodeError:
                 st.warning("UTF-8 ile decode edilemedi, latin-1 deneniyor...")
-                html_content = html_content_bytes.decode("latin-1") # Veya windows-1252 vb.
-            st.info("HTML içeriği başarıyla okundu.")
-
+                html_content = html_content_bytes.decode("latin-1")
+            st.info("HTML içeriği okundu.")
         except Exception as e:
              st.error(f"Dosya okunurken/decode edilirken hata oluştu: {e}")
 
         if html_content:
-            # BeautifulSoup ile parse et
             try:
                  soup = BeautifulSoup(html_content, 'lxml')
-                 st.info("HTML, BeautifulSoup ile başarıyla parse edildi.")
+                 st.info("HTML, BeautifulSoup ile parse edildi.")
 
-                 # Önce __NEXT_DATA__ dene
-                 df_brands = extract_brands_from_next_data(soup) # Soup objesini verelim
+                 # Önce potansiyel __NEXT_DATA__ script'lerini dene
+                 df_brands = extract_brands_from_potential_next_data(soup)
 
-                 # __NEXT_DATA__ başarısız olursa veya boş dönerse alternatif yöntemi dene
+                 # O başarısız olursa veya boş dönerse en genel HTML tarama yöntemini dene
                  if df_brands is None or df_brands.empty:
                       if df_brands is None:
-                           st.info("__NEXT_DATA__ bulunamadı veya işlenemedi, doğrudan HTML deneniyor.")
-                      else: # Boş DataFrame döndü
-                           st.info("__NEXT_DATA__ işlendi ancak veri bulunamadı, doğrudan HTML deneniyor.")
-
+                           st.info("__NEXT_DATA__ benzeri script bulunamadı/işlenemedi, en genel HTML tarama deneniyor.")
+                      else:
+                           st.info("__NEXT_DATA__ benzeri script işlendi ancak veri bulunamadı, en genel HTML tarama deneniyor.")
                       try:
-                          df_brands = extract_brands_directly(soup) # Aynı soup objesini kullan
+                          df_brands = extract_brands_directly_very_generic(soup)
                       except Exception as e:
-                          st.error(f"Alternatif HTML ayrıştırma yönteminde hata oluştu: {e}")
+                          st.error(f"En genel HTML ayrıştırma yönteminde hata oluştu: {e}")
                           df_brands = None
 
                  # Sonucu göster ve CSV indir
@@ -257,12 +193,11 @@ if uploaded_file is not None:
                      except Exception as e:
                          st.error(f"CSV oluşturulurken/indirilirken hata: {e}")
                  elif df_brands is not None: # Boş DataFrame geldiyse
-                      st.warning("Yüklenen HTML dosyasında, her iki yöntemle de (__NEXT_DATA__ veya doğrudan HTML tarama) marka filtresi verisi bulunamadı veya ayıklanamadı. Lütfen HTML'i doğru kaydettiğinizden emin olun.")
-                 # else: df_brands = None ise hata zaten yukarıda verildi.
+                      st.warning("Yüklenen HTML dosyasında, denenen yöntemlerle marka filtresi verisi bulunamadı.")
+                 # else: df_brands = None ise hata zaten yukarıda gösterildi.
 
             except Exception as e:
                 st.error(f"HTML içeriği BeautifulSoup ile parse edilirken hata oluştu: {e}")
 
-
 st.markdown("---")
-st.caption("Not: Bu uygulama, yüklediğiniz HTML dosyasının içindeki verilere dayanır. En iyi sonuç için sayfayı tarayıcıda **tamamen yüklendikten sonra** 'Farklı Kaydet -> Web Sayfası, Sadece HTML' olarak kaydedin.")
+st.caption("Not: Başarısız olursa, HTML dosyasını tarayıcıda açıp 'Brands' filtresinin olduğu bölümün HTML kodunu inceleyerek manuel kontrol edebilirsiniz.")
